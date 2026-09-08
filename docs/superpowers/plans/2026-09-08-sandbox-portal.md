@@ -373,7 +373,7 @@ git commit -m "feat: expose Sandbox readiness and runtime inventory"
 
 **Interfaces:**
 - Consumes: `InventoryOptions.RouterURL`, `RouterPathPrefix`, and model types from Task 2.
-- Produces: `matchClaim(*Sandbox, []SandboxClaim) (*SandboxClaim, string)`, `lifecycleSummary(*Sandbox, *SandboxClaim, time.Time) LifecycleSummary`, and `connectionRecords(*Sandbox, *url.URL, string) []ConnectionRecord`.
+- Produces: `matchClaim(*Sandbox, []SandboxClaim) (*SandboxClaim, string)`, `authoritativeExpiry(*Sandbox, *SandboxClaim) *time.Time`, `lifecycleSummary(*Sandbox, *SandboxClaim, time.Time) LifecycleSummary`, and `connectionRecords(*Sandbox, *url.URL, string) []ConnectionRecord`.
 
 - [ ] **Step 1: Write failing lifecycle, claim matching, warning, and router tests**
 
@@ -434,6 +434,17 @@ Expected: FAIL because claim enrichment and connection helpers are absent.
 Use the controller owner reference first, checking group, kind, name, and UID. Use status-only matching only when there is no matching owner reference and exactly one same-namespace claim has `claim.Status.SandboxStatus.Name == sandbox.Name`.
 
 ```go
+func authoritativeExpiry(sb *sandboxv1beta1.Sandbox, claim *extensionsv1beta1.SandboxClaim) *time.Time {
+	if claim == nil {
+		return lifecycle.ExpireAt(sb.Spec.ShutdownTime, nil, nil)
+	}
+	if claim.Spec.Lifecycle == nil {
+		return nil
+	}
+	finished := lifecycle.FinishedCondition(claim.Status.Conditions, string(sandboxv1beta1.SandboxConditionFinished))
+	return lifecycle.ExpireAt(claim.Spec.Lifecycle.ShutdownTime, claim.Spec.Lifecycle.TTLSecondsAfterFinished, finished)
+}
+
 func lifecycleSummary(sb *sandboxv1beta1.Sandbox, claim *extensionsv1beta1.SandboxClaim, now time.Time) LifecycleSummary {
 	shutdown := sb.Spec.ShutdownTime
 	var ttl *int32
@@ -448,7 +459,7 @@ func lifecycleSummary(sb *sandboxv1beta1.Sandbox, claim *extensionsv1beta1.Sandb
 		}
 		finished = lifecycle.FinishedCondition(claim.Status.Conditions, string(sandboxv1beta1.SandboxConditionFinished))
 	}
-	expiresAt := lifecycle.ExpireAt(shutdown, ttl, finished)
+	expiresAt := authoritativeExpiry(sb, claim)
 	var retentionDeadline *time.Time
 	if ttl != nil && finished != nil {
 		finishedAt := finished.LastTransitionTime.Time
@@ -584,7 +595,7 @@ git commit -m "feat: serve the Sandbox portal API and embedded shell"
 - Create: `internal/portal/terminal_test.go`
 
 **Interfaces:**
-- Consumes: `SandboxClient` and `ClaimClient` from Task 2 plus client-go `typedcorev1.PodsGetter`.
+- Consumes: `SandboxClient` and `ClaimClient` from Task 2, `authoritativeExpiry` from Task 3, plus client-go `typedcorev1.PodsGetter`.
 - Produces: `TerminalScope`, `TerminalTarget`, `TerminalResolver`, `NewTerminalResolver(SandboxClient, ClaimClient, typedcorev1.PodsGetter, TerminalScope, func() time.Time) *TerminalResolver`, `(*TerminalResolver).Resolve(context.Context, string, string, string) (TerminalTarget, error)`, and `*TerminalError` with safe HTTP status/message.
 
 - [ ] **Step 1: Write failing terminal authorization and target tests**
@@ -643,20 +654,13 @@ type TerminalResolver struct {
 }
 ```
 
-In `Resolve`, validate the namespace with `validation.IsDNS1123Label` and the Sandbox name with `validation.IsDNS1123Subdomain` before any API call. Get the Sandbox in that namespace. If its controller reference is a `SandboxClaim`, get that exact same-namespace claim and reject the session when verification fails. Handle a nil claim lifecycle safely and compute authoritative expiry with:
+In `Resolve`, validate the namespace with `validation.IsDNS1123Label` and the Sandbox name with `validation.IsDNS1123Subdomain` before any API call. Get the Sandbox in that namespace. If its controller reference is a `SandboxClaim`, get that exact same-namespace claim and reject the session when verification fails. Handle a nil claim lifecycle safely and reuse Task 3's authoritative helper:
 
 ```go
-var shutdown *metav1.Time
-var ttl *int32
-if claim.Spec.Lifecycle != nil {
-	shutdown = claim.Spec.Lifecycle.ShutdownTime
-	ttl = claim.Spec.Lifecycle.TTLSecondsAfterFinished
-}
-finished := lifecycle.FinishedCondition(claim.Status.Conditions, string(sandboxv1beta1.SandboxConditionFinished))
-expiresAt := lifecycle.ExpireAt(shutdown, ttl, finished)
+expiresAt := authoritativeExpiry(sandbox, claim)
 ```
 
-For a direct Sandbox, compute expiry from `sandbox.Spec.ShutdownTime`. Require non-deleting, unexpired, `OperatingMode != Suspended`, and Ready=True. Resolve the Pod name, get it, require `metav1.IsControlledBy(pod, sandbox)`, phase Running, PodReady=True, and a matching regular container.
+Pass a nil claim to the same helper for a direct Sandbox. Require non-deleting, unexpired, `OperatingMode != Suspended`, and Ready=True. Resolve the Pod name, get it, require `metav1.IsControlledBy(pod, sandbox)`, phase Running, PodReady=True, and a matching regular container.
 
 Map API `Forbidden` to 403, `NotFound` to 404 only for the requested Sandbox, and dependency disappearance to 409. Map other Kubernetes errors to 503. Return fixed public messages such as `Sandbox is not Ready`, `Sandbox has expired`, and `backing Pod is unavailable`; preserve the wrapped error for structured server logging but never serialize it.
 
@@ -682,6 +686,7 @@ git commit -m "feat: validate Sandbox terminal targets before exec"
 - Create: `internal/portal/executor_test.go`
 - Create: `internal/portal/session.go`
 - Create: `internal/portal/session_test.go`
+- Modify: `internal/portal/model.go`
 - Modify: `internal/portal/server.go`
 - Modify: `internal/portal/server_test.go`
 
