@@ -18,8 +18,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -278,6 +280,95 @@ func TestServerShellUsesExternalAssets(t *testing.T) {
 	assert.NotContains(t, html, "<script>")
 	assert.Contains(t, html, `aria-live="polite"`)
 	assert.Contains(t, html, `id="terminal-drawer"`)
+}
+
+func TestEmbeddedPortalAssets(t *testing.T) {
+	server := newHTTPTestServer(t, ServerOptions{})
+	tests := []struct {
+		path        string
+		contentType string
+	}{
+		{"/", "text/html"},
+		{"/app.css", "text/css"},
+		{"/app.js", "text/javascript"},
+		{"/vendor/xterm.js", "text/javascript"},
+		{"/vendor/xterm.css", "text/css"},
+		{"/vendor/addon-fit.js", "text/javascript"},
+		{"/vendor/LICENSE.xterm", "text/plain"},
+		{"/vendor/LICENSE.addon-fit", "text/plain"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			response := request(t, server, http.MethodGet, tt.path)
+			defer response.Body.Close()
+			body, err := io.ReadAll(response.Body)
+			require.NoError(t, err)
+
+			assert.Equal(t, http.StatusOK, response.StatusCode)
+			assert.NotEmpty(t, body)
+			assert.True(t, strings.HasPrefix(response.Header.Get("Content-Type"), tt.contentType), response.Header.Get("Content-Type"))
+		})
+	}
+
+	response := request(t, server, http.MethodGet, "/")
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	html := string(body)
+	documentStart := strings.Index(html, "<!doctype html>")
+	require.NotEqual(t, -1, documentStart)
+	document := html[documentStart:]
+
+	for _, reference := range []string{
+		`href="/vendor/xterm.css"`,
+		`src="/vendor/xterm.js"`,
+		`src="/vendor/addon-fit.js"`,
+		`href="/app.css"`,
+		`src="/app.js"`,
+	} {
+		assert.Contains(t, document, reference)
+	}
+	assert.NotContains(t, document, "http://")
+	assert.NotContains(t, document, "https://")
+	assert.NotRegexp(t, regexp.MustCompile(`(?i)<script(?:\s[^>]*)?>\s*[^<\s]`), document)
+	assert.NotRegexp(t, regexp.MustCompile(`(?i)<style(?:\s|>)`), document)
+	assert.NotRegexp(t, regexp.MustCompile(`(?i)\son[a-z]+\s*=`), document)
+}
+
+func TestPortalJavaScriptContract(t *testing.T) {
+	body, err := fs.ReadFile(embeddedWeb, "web/app.js")
+	require.NoError(t, err)
+	javascript := string(body)
+
+	for _, contract := range []string{
+		"/api/v1/sandboxes",
+		"5000",
+		"visibilitychange",
+		"/api/v1/namespaces/${encodeURIComponent(record.namespace)}/sandboxes/${encodeURIComponent(record.name)}/terminal",
+		"namespace",
+		"name",
+		"claimName",
+		"createdAt",
+		"operatingMode",
+		"ready",
+		"user",
+		"agent",
+		"containers",
+		"runtimeClass",
+		"lifecycle",
+		"podIPs",
+		"serviceFQDN",
+		"connections",
+		"terminalEligible",
+		"input",
+		"resize",
+	} {
+		assert.Contains(t, javascript, contract)
+	}
+	assert.NotContains(t, javascript, ".innerHTML")
+	assert.NotContains(t, javascript, ".outerHTML")
+	assert.NotContains(t, javascript, "insertAdjacentHTML")
 }
 
 func TestServerFirstPartyAssetsHaveLicenseHeaders(t *testing.T) {
