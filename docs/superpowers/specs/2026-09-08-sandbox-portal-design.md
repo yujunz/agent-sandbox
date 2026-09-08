@@ -165,10 +165,11 @@ Terminal validation happens before the WebSocket upgrade:
 1. Verify the request Origin matches the portal's own loopback origin.
 2. Verify the namespace is inside the configured scope.
 3. Re-read the named Sandbox from the Kubernetes API.
-4. Require no deletion timestamp, no elapsed shutdown time, and `Ready=True`.
-5. Resolve the backing Pod from the legacy non-empty pod-name annotation, falling back to the Sandbox name.
-6. Read the Pod and require that it is controlled by the Sandbox UID, Running, and Ready.
-7. Resolve the requested container against the live Pod; default to its first regular container.
+4. If the Sandbox has a `SandboxClaim` controller owner reference, re-read that claim and use its lifecycle as authoritative. Reject the session if that claim cannot be verified. Otherwise, use the Sandbox lifecycle.
+5. Require no deletion timestamp, no elapsed authoritative shutdown time, and `Ready=True`.
+6. Resolve the backing Pod from the legacy non-empty pod-name annotation, falling back to the Sandbox name.
+7. Read the Pod and require that it is controlled by the Sandbox UID, Running, and Ready.
+8. Resolve the requested container against the live Pod; default to its first regular container.
 
 The endpoint never accepts a Pod name or arbitrary command from the browser. It always executes the fixed command `/bin/sh` with `stdin`, `stdout`, and TTY enabled. Images without `/bin/sh` receive a clear terminal error rather than an automatic command substitution.
 
@@ -243,7 +244,7 @@ Implementation follows test-driven development. Each behavior starts with a focu
 ### Terminal tests
 
 - Origin and namespace rejection.
-- Missing, deleting, expired, or non-Ready Sandbox rejection.
+- Missing, deleting, directly expired, claim-expired, or non-Ready Sandbox rejection.
 - Pod ownership, phase, readiness, and container validation.
 - Default-container selection and fixed `/bin/sh` execution request.
 - Input, output, resize, clean exit, failure, disconnect, and cancellation behavior through a fake executor.
