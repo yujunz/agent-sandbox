@@ -401,8 +401,8 @@ func TestPortalJavaScriptAccessibilityContract(t *testing.T) {
 		"button.dataset.terminalName",
 		"function trapTerminalFocus(event)",
 		"function keepTerminalFocus(event)",
-		`document.addEventListener("keydown", trapTerminalFocus)`,
-		`document.removeEventListener("keydown", trapTerminalFocus)`,
+		`document.addEventListener("keydown", trapTerminalFocus, true)`,
+		`document.removeEventListener("keydown", trapTerminalFocus, true)`,
 		`document.addEventListener("focusin", keepTerminalFocus)`,
 		`document.removeEventListener("focusin", keepTerminalFocus)`,
 		`button.setAttribute("aria-describedby", reason.id)`,
@@ -411,6 +411,8 @@ func TestPortalJavaScriptAccessibilityContract(t *testing.T) {
 	} {
 		assert.Contains(t, javascript, contract)
 	}
+	assert.NotContains(t, javascript, `document.addEventListener("keydown", trapTerminalFocus)`)
+	assert.NotContains(t, javascript, `document.removeEventListener("keydown", trapTerminalFocus)`)
 	assert.NotContains(t, javascript, "terminalReturnFocus")
 }
 

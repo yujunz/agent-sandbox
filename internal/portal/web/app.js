@@ -588,7 +588,7 @@
       terminalResizeHandler = null;
     }
     window.removeEventListener("resize", fitTerminal);
-    document.removeEventListener("keydown", trapTerminalFocus);
+    document.removeEventListener("keydown", trapTerminalFocus, true);
     document.removeEventListener("focusin", keepTerminalFocus);
     if (terminal) {
       terminal.clear();
@@ -640,7 +640,7 @@
       sendTerminalControl({ type: "resize", cols, rows });
     });
     window.addEventListener("resize", fitTerminal);
-    document.addEventListener("keydown", trapTerminalFocus);
+    document.addEventListener("keydown", trapTerminalFocus, true);
     document.addEventListener("focusin", keepTerminalFocus);
     elements.closeTerminal.focus();
     terminalFocusFrame = window.requestAnimationFrame(() => {
