@@ -110,7 +110,7 @@ func validateOptions(opts *options, namespaceExplicit bool) error {
 			return fmt.Errorf("%s is not a valid label key", name)
 		}
 	}
-	if opts.routerPathPrefix != "" && (!strings.HasPrefix(opts.routerPathPrefix, "/") || strings.HasPrefix(opts.routerPathPrefix, "//")) {
+	if opts.routerPathPrefix == "" || !strings.HasPrefix(opts.routerPathPrefix, "/") || strings.HasPrefix(opts.routerPathPrefix, "//") {
 		return fmt.Errorf("--router-path-prefix %q must begin with exactly one slash", opts.routerPathPrefix)
 	}
 	_, err := parseRouterURL(opts.routerURL)

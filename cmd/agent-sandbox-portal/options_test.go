@@ -58,8 +58,11 @@ func TestValidateOptions(t *testing.T) {
 		{"defaults", defaultOptions(), false, ""},
 		{"namespace and all namespaces", options{listenAddress: "127.0.0.1:8080", namespace: "team-a", allNamespaces: true, userLabel: "sandbox.users.io/user", agentLabel: "sandbox.users.io/agent"}, true, "mutually exclusive"},
 		{"invalid user label", options{listenAddress: "127.0.0.1:8080", userLabel: "bad label", agentLabel: "sandbox.users.io/agent"}, false, "--user-label"},
-		{"router credentials", options{listenAddress: "127.0.0.1:8080", userLabel: "sandbox.users.io/user", agentLabel: "sandbox.users.io/agent", routerURL: "https://user@example.test"}, false, "credentials"},
-		{"router query", options{listenAddress: "127.0.0.1:8080", userLabel: "sandbox.users.io/user", agentLabel: "sandbox.users.io/agent", routerURL: "https://example.test/base?q=x"}, false, "query"},
+		{"router credentials", options{listenAddress: "127.0.0.1:8080", userLabel: "sandbox.users.io/user", agentLabel: "sandbox.users.io/agent", routerURL: "https://user@example.test", routerPathPrefix: "/sandboxes"}, false, "credentials"},
+		{"router query", options{listenAddress: "127.0.0.1:8080", userLabel: "sandbox.users.io/user", agentLabel: "sandbox.users.io/agent", routerURL: "https://example.test/base?q=x", routerPathPrefix: "/sandboxes"}, false, "query"},
+		{"router prefix root", options{listenAddress: "127.0.0.1:8080", userLabel: "sandbox.users.io/user", agentLabel: "sandbox.users.io/agent", routerPathPrefix: "/"}, false, ""},
+		{"router prefix empty", options{listenAddress: "127.0.0.1:8080", userLabel: "sandbox.users.io/user", agentLabel: "sandbox.users.io/agent", routerPathPrefix: ""}, false, "exactly one slash"},
+		{"router prefix double slash", options{listenAddress: "127.0.0.1:8080", userLabel: "sandbox.users.io/user", agentLabel: "sandbox.users.io/agent", routerPathPrefix: "//sandboxes"}, false, "exactly one slash"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
