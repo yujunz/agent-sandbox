@@ -70,6 +70,23 @@ func TestTerminalResolver(t *testing.T) {
 			},
 		},
 		{
+			name:        "all-namespaces scope resolves a Sandbox in another namespace",
+			namespace:   "team-b",
+			sandboxName: "box-a",
+			container:   "workspace",
+			scope:       TerminalScope{Namespace: "team-a", AllNamespaces: true},
+			mutate: func(f *terminalFixture) {
+				f.sandbox.Namespace = "team-b"
+				f.pods[0].Namespace = "team-b"
+			},
+			want: TerminalTarget{
+				Namespace:   "team-b",
+				SandboxName: "box-a",
+				PodName:     "adopted-pod",
+				Container:   "workspace",
+			},
+		},
+		{
 			name:           "invalid namespace",
 			namespace:      "Team_A",
 			sandboxName:    "box-a",

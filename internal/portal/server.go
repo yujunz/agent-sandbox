@@ -21,8 +21,10 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +33,8 @@ import (
 
 // xterm.js creates runtime style elements and style attributes; scripts remain restricted to self-hosted assets.
 const contentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+
+const invalidHostMessage = "Host is not allowed"
 
 //go:embed web
 var embeddedWeb embed.FS
@@ -67,6 +71,7 @@ func NewServer(opts ServerOptions) (http.Handler, error) {
 		)
 	}
 	mux.Handle("/api/v1/sandboxes", apiMethod(http.MethodGet, http.HandlerFunc(s.inventoryHandler)))
+	mux.HandleFunc("/api/v1", apiNotFound)
 	mux.HandleFunc("/api/v1/", apiNotFound)
 	mux.HandleFunc("/api/", apiNotFound)
 	mux.HandleFunc("/api", apiNotFound)
@@ -156,6 +161,80 @@ func securityHeaders(next http.Handler) http.Handler {
 		if r.URL.Path == "/api" || strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Cache-Control", "no-store")
 		}
+		if !loopbackAuthority(r.Host) {
+			if r.URL.Path == "/api" || strings.HasPrefix(r.URL.Path, "/api/") {
+				writeAPIError(w, http.StatusForbidden, invalidHostMessage)
+			} else {
+				http.Error(w, invalidHostMessage, http.StatusForbidden)
+			}
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func loopbackAuthority(authority string) bool {
+	if authority == "" || strings.ContainsAny(authority, "/?#@") {
+		return false
+	}
+
+	hostname := authority
+	if strings.HasPrefix(authority, "[") {
+		closingBracket := strings.IndexByte(authority, ']')
+		if closingBracket < 2 {
+			return false
+		}
+		hostname = authority[1:closingBracket]
+		suffix := authority[closingBracket+1:]
+		if suffix != "" && (!strings.HasPrefix(suffix, ":") || !validAuthorityPort(suffix[1:])) {
+			return false
+		}
+	} else {
+		switch strings.Count(authority, ":") {
+		case 0:
+		case 1:
+			var port string
+			var err error
+			hostname, port, err = net.SplitHostPort(authority)
+			if err != nil || !validAuthorityPort(port) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+
+	return loopbackHostname(hostname)
+}
+
+func validAuthorityPort(port string) bool {
+	if port == "" {
+		return false
+	}
+	_, err := strconv.ParseUint(port, 10, 16)
+	return err == nil
+}
+
+func loopbackHostname(hostname string) bool {
+	if strings.EqualFold(hostname, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(hostname)
+	return ip != nil && ip.IsLoopback()
+}
+
+func websocketResponseHeaders(header http.Header) http.Header {
+	responseHeader := make(http.Header, 5)
+	for _, name := range [...]string{
+		"Content-Security-Policy",
+		"X-Content-Type-Options",
+		"Referrer-Policy",
+		"X-Frame-Options",
+		"Cache-Control",
+	} {
+		if values := header.Values(name); len(values) != 0 {
+			responseHeader[name] = append([]string(nil), values...)
+		}
+	}
+	return responseHeader
 }

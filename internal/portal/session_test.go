@@ -80,6 +80,37 @@ func TestTerminalSessionBridgesInputOutputAndResize(t *testing.T) {
 	assert.Equal(t, "adopted-pod", request.Target.PodName)
 }
 
+func TestTerminalUpgradeIncludesSecurityHeaders(t *testing.T) {
+	executor := executorFunc(func(ctx context.Context, _ remotecommand.StreamOptions) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	server := newTerminalTestServer(t.Context(), t, executorFactoryFunc(func(ExecRequest) (remotecommand.Executor, error) {
+		return executor, nil
+	}), logr.Discard())
+
+	conn, response, err := dialTerminalResponse(
+		t,
+		server.URL,
+		terminalOrigin(t, server.URL),
+		"team-a",
+		"box-a",
+		"workspace",
+		"",
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	require.NotNil(t, response)
+	defer response.Body.Close()
+
+	assert.Equal(t, http.StatusSwitchingProtocols, response.StatusCode)
+	assert.Equal(t, testContentSecurityPolicy, response.Header.Get("Content-Security-Policy"))
+	assert.Equal(t, "nosniff", response.Header.Get("X-Content-Type-Options"))
+	assert.Equal(t, "no-referrer", response.Header.Get("Referrer-Policy"))
+	assert.Equal(t, "DENY", response.Header.Get("X-Frame-Options"))
+	assert.Equal(t, "no-store", response.Header.Get("Cache-Control"))
+}
+
 func TestTerminalRejectsMissingCrossOriginAndMalformedOriginBeforeUpgrade(t *testing.T) {
 	tests := []struct {
 		name   string

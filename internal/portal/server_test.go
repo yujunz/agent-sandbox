@@ -137,6 +137,72 @@ func TestServerSecurityHeaders(t *testing.T) {
 	}
 }
 
+func TestServerRejectsUnsafeHostBeforeRoutingOrKubernetesReads(t *testing.T) {
+	tests := []struct {
+		name string
+		host string
+		path string
+	}{
+		{name: "static route", host: "attacker.example:8080", path: "/"},
+		{name: "health route", host: "attacker.example:8080", path: "/healthz"},
+		{name: "inventory route", host: "attacker.example:8080", path: "/api/v1/sandboxes"},
+		{name: "malformed authority", host: "localhost:not-a-port", path: "/healthz"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sandboxClient := newSandboxClientset(t, readySandbox("box-a", "team-a"))
+			claimClient := extensionsfake.NewSimpleClientset()
+			inventory := NewInventory(
+				sandboxClient.AgentsV1beta1(),
+				claimClient.ExtensionsV1beta1(),
+				inventoryOptions("team-a", false, time.Unix(200, 0)),
+			)
+			handler, err := NewServer(ServerOptions{Inventory: inventory, Log: logr.Discard()})
+			require.NoError(t, err)
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "http://localhost"+tt.path, nil)
+			req.Host = tt.host
+
+			handler.ServeHTTP(recorder, req)
+
+			assert.Equal(t, http.StatusForbidden, recorder.Code)
+			assert.Equal(t, testContentSecurityPolicy, recorder.Header().Get("Content-Security-Policy"))
+			assert.Equal(t, "nosniff", recorder.Header().Get("X-Content-Type-Options"))
+			assert.Equal(t, "no-referrer", recorder.Header().Get("Referrer-Policy"))
+			assert.Equal(t, "DENY", recorder.Header().Get("X-Frame-Options"))
+			if strings.HasPrefix(tt.path, "/api/") {
+				assert.Equal(t, "no-store", recorder.Header().Get("Cache-Control"))
+				assert.JSONEq(t, `{"error":"Host is not allowed"}`, recorder.Body.String())
+			} else {
+				assert.Equal(t, "Host is not allowed\n", recorder.Body.String())
+			}
+			assert.Empty(t, sandboxClient.Actions())
+			assert.Empty(t, claimClient.Actions())
+		})
+	}
+}
+
+func TestServerAPIv1ReturnsJSONNotFoundWithoutRedirect(t *testing.T) {
+	handler, err := NewServer(ServerOptions{
+		Inventory: NewInventory(
+			newSandboxClientset(t).AgentsV1beta1(),
+			extensionsfake.NewSimpleClientset().ExtensionsV1beta1(),
+			inventoryOptions("team-a", false, time.Unix(200, 0)),
+		),
+		Log: logr.Discard(),
+	})
+	require.NoError(t, err)
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://localhost/api/v1", nil))
+
+	assert.Equal(t, http.StatusNotFound, recorder.Code)
+	assert.Empty(t, recorder.Header().Get("Location"))
+	assert.True(t, strings.HasPrefix(recorder.Header().Get("Content-Type"), "application/json"))
+	assert.JSONEq(t, `{"error":"API endpoint not found"}`, recorder.Body.String())
+}
+
 func TestServerCSPAllowsXtermRuntimeStylesWithoutInlineScripts(t *testing.T) {
 	server := newHTTPTestServer(t, ServerOptions{})
 	response := request(t, server, http.MethodGet, "/")

@@ -19,6 +19,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"os"
@@ -80,10 +81,20 @@ func TestRunMainDoesNotLogKubeconfigFailureDetails(t *testing.T) {
 	)
 
 	assert.Equal(t, 1, exitCode)
-	assert.NotEmpty(t, logs.String(), "the command failure must be logged")
-	assert.NotContains(t, logs.String(), sensitivePath)
-	assert.NotContains(t, logs.String(), "sensitive-kubeconfig-location")
-	assert.NotContains(t, logs.String(), "no such file or directory")
+	rawLogs := logs.String()
+	assert.NotEmpty(t, rawLogs, "the command failure must be logged")
+	var entry struct {
+		Message  string `json:"msg"`
+		Error    string `json:"error"`
+		Category string `json:"category"`
+	}
+	require.NoError(t, json.NewDecoder(strings.NewReader(rawLogs)).Decode(&entry))
+	assert.Equal(t, "run Sandbox portal", entry.Message)
+	assert.Equal(t, "portal command failed", entry.Error)
+	assert.Equal(t, "startup", entry.Category)
+	assert.NotContains(t, rawLogs, sensitivePath)
+	assert.NotContains(t, rawLogs, "sensitive-kubeconfig-location")
+	assert.NotContains(t, rawLogs, "no such file or directory")
 }
 
 func TestListenLoopbackRejectsResolvedNonLoopbackAddress(t *testing.T) {

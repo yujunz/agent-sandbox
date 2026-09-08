@@ -105,9 +105,15 @@ func validateOptions(opts *options, namespaceExplicit bool) error {
 	if opts.allNamespaces && namespaceExplicit {
 		return errors.New("--namespace and --all-namespaces are mutually exclusive")
 	}
-	for name, value := range map[string]string{"--user-label": opts.userLabel, "--agent-label": opts.agentLabel} {
-		if len(validation.IsQualifiedName(value)) != 0 {
-			return fmt.Errorf("%s is not a valid label key", name)
+	for _, label := range []struct {
+		name  string
+		value string
+	}{
+		{name: "--user-label", value: opts.userLabel},
+		{name: "--agent-label", value: opts.agentLabel},
+	} {
+		if len(validation.IsQualifiedName(label.value)) != 0 {
+			return fmt.Errorf("%s is not a valid label key", label.name)
 		}
 	}
 	if opts.routerPathPrefix == "" || !strings.HasPrefix(opts.routerPathPrefix, "/") || strings.HasPrefix(opts.routerPathPrefix, "//") {

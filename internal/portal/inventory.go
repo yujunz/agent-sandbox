@@ -132,31 +132,46 @@ func (i *Inventory) projectSandbox(
 		operatingMode = sandboxv1beta1.SandboxOperatingModeRunning
 	}
 
-	lifecycle := lifecycleSummary(sandbox, claim, now)
+	var authoritativeClaim *extensionsv1beta1.SandboxClaim
+	if controllerOwnerClaimVerified(sandbox, claim) {
+		authoritativeClaim = claim
+	}
+	lifecycle := lifecycleSummary(sandbox, authoritativeClaim, now)
 	claimName := ""
 	if claim != nil {
 		claimName = claim.Name
 	} else if owner := claimControllerOwner(sandbox); owner != nil {
 		claimName = owner.Name
 	}
-	claimLifecycleUnavailable := claim == nil && claimName != ""
+	claimLifecycleUnavailable := claimControllerOwner(sandbox) != nil && authoritativeClaim == nil
 	return SandboxRecord{
-		Namespace:        sandbox.Namespace,
-		Name:             sandbox.Name,
-		ClaimName:        claimName,
-		CreatedAt:        sandbox.CreationTimestamp.Time,
-		OperatingMode:    string(operatingMode),
-		Ready:            ready,
-		User:             preferredLabel(sandbox.Spec.PodTemplate.ObjectMeta.Labels, sandbox.Labels, i.opts.UserLabel),
-		Agent:            preferredLabel(sandbox.Spec.PodTemplate.ObjectMeta.Labels, sandbox.Labels, i.opts.AgentLabel),
-		Containers:       projectContainers(sandbox.Spec.PodTemplate.Spec.Containers),
-		RuntimeClass:     valueOrEmpty(sandbox.Spec.PodTemplate.Spec.RuntimeClassName),
-		Lifecycle:        lifecycle,
-		PodIPs:           append([]string{}, sandbox.Status.PodIPs...),
-		ServiceFQDN:      sandbox.Status.ServiceFQDN,
-		Connections:      connectionRecords(sandbox, i.opts.RouterURL, i.opts.RouterPathPrefix),
-		TerminalEligible: ready.Status == string(metav1.ConditionTrue) && sandbox.DeletionTimestamp == nil && !lifecycle.Expired && !claimLifecycleUnavailable,
+		Namespace:     sandbox.Namespace,
+		Name:          sandbox.Name,
+		ClaimName:     claimName,
+		CreatedAt:     sandbox.CreationTimestamp.Time,
+		OperatingMode: string(operatingMode),
+		Ready:         ready,
+		User:          preferredLabel(sandbox.Spec.PodTemplate.ObjectMeta.Labels, sandbox.Labels, i.opts.UserLabel),
+		Agent:         preferredLabel(sandbox.Spec.PodTemplate.ObjectMeta.Labels, sandbox.Labels, i.opts.AgentLabel),
+		Containers:    projectContainers(sandbox.Spec.PodTemplate.Spec.Containers),
+		RuntimeClass:  valueOrEmpty(sandbox.Spec.PodTemplate.Spec.RuntimeClassName),
+		Lifecycle:     lifecycle,
+		PodIPs:        append([]string{}, sandbox.Status.PodIPs...),
+		ServiceFQDN:   sandbox.Status.ServiceFQDN,
+		Connections:   connectionRecords(sandbox, i.opts.RouterURL, i.opts.RouterPathPrefix),
+		TerminalEligible: ready.Status == string(metav1.ConditionTrue) &&
+			operatingMode != sandboxv1beta1.SandboxOperatingModeSuspended &&
+			sandbox.DeletionTimestamp == nil &&
+			!lifecycle.Expired &&
+			!claimLifecycleUnavailable,
 	}
+}
+
+func controllerOwnerClaimVerified(sandbox *sandboxv1beta1.Sandbox, claim *extensionsv1beta1.SandboxClaim) bool {
+	owner := claimControllerOwner(sandbox)
+	return owner != nil && claim != nil &&
+		owner.UID != "" && claim.UID != "" && owner.UID == claim.UID &&
+		claim.Namespace == sandbox.Namespace && claim.Name == owner.Name
 }
 
 func summarizeReady(conditions []metav1.Condition) ConditionSummary {

@@ -19,10 +19,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -113,7 +111,7 @@ func (h *TerminalHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := h.upgrader.Upgrade(w, r, nil)
+	conn, err := h.upgrader.Upgrade(w, r, websocketResponseHeaders(w.Header()))
 	if err != nil {
 		return
 	}
@@ -130,18 +128,7 @@ func sameOrigin(r *http.Request) bool {
 		return false
 	}
 	return origin.User == nil && origin.Path == "" && origin.RawQuery == "" && origin.Fragment == "" &&
-		loopbackHostname(origin.Hostname())
-}
-
-func loopbackHostname(hostname string) bool {
-	if hostname == "" {
-		return false
-	}
-	if strings.EqualFold(hostname, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(hostname)
-	return ip != nil && ip.IsLoopback()
+		loopbackAuthority(r.Host)
 }
 
 type terminalClientResult int

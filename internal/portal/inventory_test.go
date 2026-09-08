@@ -245,6 +245,27 @@ func TestInventoryClaimOwnerMissingDoesNotFallBackToStatusMatch(t *testing.T) {
 	assert.False(t, record.TerminalEligible)
 }
 
+func TestInventoryStatusOnlyClaimDoesNotOverrideDirectSandboxLifecycle(t *testing.T) {
+	now := time.Unix(400, 0)
+	sandboxShutdown := metav1.NewTime(time.Unix(500, 0))
+	claimShutdown := metav1.NewTime(time.Unix(300, 0))
+	statusMatch := claimForSandbox("status-match", "team-a", "box-a", types.UID("status-uid"))
+	statusMatch.Spec.Lifecycle = &extensionsv1beta1.Lifecycle{ShutdownTime: &claimShutdown}
+	sb := readySandbox("box-a", "team-a")
+	sb.Spec.ShutdownTime = &sandboxShutdown
+
+	record := listInventoryWithClaims(
+		t,
+		now,
+		[]*sandboxv1beta1.Sandbox{sb},
+		[]*extensionsv1beta1.SandboxClaim{statusMatch},
+	).Sandboxes[0]
+
+	assert.Equal(t, "status-match", record.ClaimName)
+	assert.Equal(t, LifecycleSummary{Source: "Sandbox", ExpiresAt: new(sandboxShutdown.Time)}, record.Lifecycle)
+	assert.True(t, record.TerminalEligible)
+}
+
 func TestMatchClaimOwnerReferenceWinsOverStatusMatch(t *testing.T) {
 	sb := readySandbox("box-a", "team-a")
 	owner := claimForSandbox("owner", "team-a", "another-box", types.UID("owner-uid"))
@@ -325,7 +346,7 @@ func TestInventoryDeletingAndSuspendedTerminalEligibility(t *testing.T) {
 	deleting.DeletionTimestamp = &deletionTime
 	deleting.Finalizers = []string{"test.example/finalizer"}
 
-	suspended := sandboxWithReady("suspended", "team-a", readyCondition(metav1.ConditionFalse))
+	suspended := sandboxWithReady("suspended", "team-a", readyCondition(metav1.ConditionTrue))
 	suspended.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
 
 	expired := sandboxWithReady("expired", "team-a", readyCondition(metav1.ConditionTrue))

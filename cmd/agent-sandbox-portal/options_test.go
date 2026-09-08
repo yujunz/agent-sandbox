@@ -76,6 +76,17 @@ func TestValidateOptions(t *testing.T) {
 	}
 }
 
+func TestValidateOptionsReportsInvalidLabelsInFlagOrder(t *testing.T) {
+	opts := defaultOptions()
+	opts.userLabel = "bad user label"
+	opts.agentLabel = "bad agent label"
+
+	for range 100 {
+		err := validateOptions(&opts, false)
+		require.EqualError(t, err, "--user-label is not a valid label key")
+	}
+}
+
 func TestResolveConfigUsesCurrentContextNamespace(t *testing.T) {
 	resolved := resolveTestConfig(t, "")
 	assert.Equal(t, "dev", resolved.contextName)
