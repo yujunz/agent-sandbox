@@ -23,11 +23,15 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	agentsv1beta1 "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned/typed/api/v1beta1"
-	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/clients/k8s/extensions/clientset/versioned/typed/api/v1beta1"
+	claimsv1beta1 "sigs.k8s.io/agent-sandbox/clients/k8s/extensions/clientset/versioned/typed/api/v1beta1"
+	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
+	"sigs.k8s.io/agent-sandbox/internal/lifecycle"
 )
 
 // SandboxClient provides namespace-scoped generated Sandbox clients.
@@ -37,7 +41,7 @@ type SandboxClient interface {
 
 // ClaimClient provides namespace-scoped generated SandboxClaim clients.
 type ClaimClient interface {
-	SandboxClaims(namespace string) extensionsv1beta1.SandboxClaimInterface
+	SandboxClaims(namespace string) claimsv1beta1.SandboxClaimInterface
 }
 
 // InventoryOptions configures inventory scope, ownership labels, and link generation.
@@ -80,11 +84,25 @@ func (i *Inventory) List(ctx context.Context) (InventoryResponse, error) {
 	if err != nil {
 		return InventoryResponse{}, fmt.Errorf("list Sandboxes: %w", err)
 	}
+	claims, claimErr := i.claims.SandboxClaims(namespace).List(ctx, metav1.ListOptions{})
+	claimDataAvailable := claimErr == nil
+	warnings := make([]string, 0)
+	if claimErr != nil {
+		warnings = append(warnings, claimListWarning(claimErr))
+	}
 
 	now := i.opts.Now()
 	records := make([]SandboxRecord, 0, len(list.Items))
 	for idx := range list.Items {
-		records = append(records, i.projectSandbox(&list.Items[idx], now))
+		var claim *extensionsv1beta1.SandboxClaim
+		if claimDataAvailable {
+			var warning string
+			claim, warning = matchClaim(&list.Items[idx], claims.Items)
+			if warning != "" {
+				warnings = append(warnings, warning)
+			}
+		}
+		records = append(records, i.projectSandbox(&list.Items[idx], claim, claimDataAvailable, now))
 	}
 	slices.SortFunc(records, func(left, right SandboxRecord) int {
 		if namespaceOrder := cmp.Compare(left.Namespace, right.Namespace); namespaceOrder != 0 {
@@ -98,21 +116,37 @@ func (i *Inventory) List(ctx context.Context) (InventoryResponse, error) {
 		Context:       i.opts.Context,
 		Namespace:     namespace,
 		AllNamespaces: i.opts.AllNamespaces,
+		Warnings:      warnings,
 		Sandboxes:     records,
 	}, nil
 }
 
-func (i *Inventory) projectSandbox(sandbox *sandboxv1beta1.Sandbox, now time.Time) SandboxRecord {
+func (i *Inventory) projectSandbox(
+	sandbox *sandboxv1beta1.Sandbox,
+	claim *extensionsv1beta1.SandboxClaim,
+	claimDataAvailable bool,
+	now time.Time,
+) SandboxRecord {
 	ready := summarizeReady(sandbox.Status.Conditions)
 	operatingMode := sandbox.Spec.OperatingMode
 	if operatingMode == "" {
 		operatingMode = sandboxv1beta1.SandboxOperatingModeRunning
 	}
 
-	lifecycle := summarizeSandboxLifecycle(sandbox.Spec.ShutdownTime, now)
+	lifecycle := lifecycleSummary(sandbox, claim, now)
+	claimName := ""
+	if claim != nil {
+		claimName = claim.Name
+	} else if !claimDataAvailable {
+		if owner := claimControllerOwner(sandbox); owner != nil {
+			claimName = owner.Name
+		}
+	}
+	claimLifecycleUnavailable := !claimDataAvailable && claimName != ""
 	return SandboxRecord{
 		Namespace:        sandbox.Namespace,
 		Name:             sandbox.Name,
+		ClaimName:        claimName,
 		CreatedAt:        sandbox.CreationTimestamp.Time,
 		OperatingMode:    string(operatingMode),
 		Ready:            ready,
@@ -123,8 +157,8 @@ func (i *Inventory) projectSandbox(sandbox *sandboxv1beta1.Sandbox, now time.Tim
 		Lifecycle:        lifecycle,
 		PodIPs:           append([]string{}, sandbox.Status.PodIPs...),
 		ServiceFQDN:      sandbox.Status.ServiceFQDN,
-		Connections:      []ConnectionRecord{},
-		TerminalEligible: ready.Status == string(metav1.ConditionTrue) && sandbox.DeletionTimestamp == nil && !lifecycle.Expired,
+		Connections:      connectionRecords(sandbox, i.opts.RouterURL, i.opts.RouterPathPrefix),
+		TerminalEligible: ready.Status == string(metav1.ConditionTrue) && sandbox.DeletionTimestamp == nil && !lifecycle.Expired && !claimLifecycleUnavailable,
 	}
 }
 
@@ -142,15 +176,100 @@ func summarizeReady(conditions []metav1.Condition) ConditionSummary {
 	}
 }
 
-func summarizeSandboxLifecycle(shutdownTime *metav1.Time, now time.Time) LifecycleSummary {
-	if shutdownTime == nil {
-		return LifecycleSummary{}
+func matchClaim(sandbox *sandboxv1beta1.Sandbox, claims []extensionsv1beta1.SandboxClaim) (*extensionsv1beta1.SandboxClaim, string) {
+	if owner := claimControllerOwner(sandbox); owner != nil {
+		for idx := range claims {
+			claim := &claims[idx]
+			if claim.Namespace == sandbox.Namespace && claim.Name == owner.Name && claim.UID == owner.UID {
+				return claim, ""
+			}
+		}
 	}
-	expiresAt := shutdownTime.Time
+
+	var matched *extensionsv1beta1.SandboxClaim
+	for idx := range claims {
+		claim := &claims[idx]
+		if claim.Namespace != sandbox.Namespace || claim.Status.SandboxStatus.Name != sandbox.Name {
+			continue
+		}
+		if matched != nil {
+			return nil, fmt.Sprintf(
+				"multiple SandboxClaims reference Sandbox %s/%s; lifecycle enrichment is unavailable",
+				sandbox.Namespace,
+				sandbox.Name,
+			)
+		}
+		matched = claim
+	}
+	return matched, ""
+}
+
+func claimControllerOwner(sandbox *sandboxv1beta1.Sandbox) *metav1.OwnerReference {
+	for idx := range sandbox.OwnerReferences {
+		owner := &sandbox.OwnerReferences[idx]
+		if owner.Controller == nil || !*owner.Controller || owner.Kind != extensionsv1beta1.SandboxClaimKind {
+			continue
+		}
+		groupVersion, err := schema.ParseGroupVersion(owner.APIVersion)
+		if err == nil && groupVersion.Group == extensionsv1beta1.GroupVersion.Group {
+			return owner
+		}
+	}
+	return nil
+}
+
+func authoritativeExpiry(sandbox *sandboxv1beta1.Sandbox, claim *extensionsv1beta1.SandboxClaim) *time.Time {
+	if claim == nil {
+		return lifecycle.ExpireAt(sandbox.Spec.ShutdownTime, nil, nil)
+	}
+	if claim.Spec.Lifecycle == nil {
+		return nil
+	}
+	finished := lifecycle.FinishedCondition(claim.Status.Conditions, string(sandboxv1beta1.SandboxConditionFinished))
+	return lifecycle.ExpireAt(claim.Spec.Lifecycle.ShutdownTime, claim.Spec.Lifecycle.TTLSecondsAfterFinished, finished)
+}
+
+func lifecycleSummary(sandbox *sandboxv1beta1.Sandbox, claim *extensionsv1beta1.SandboxClaim, now time.Time) LifecycleSummary {
+	shutdown := sandbox.Spec.ShutdownTime
+	var ttl *int32
+	var finished *metav1.Condition
+	source := "Sandbox"
+	if claim != nil {
+		source = "SandboxClaim"
+		shutdown = nil
+		if claim.Spec.Lifecycle != nil {
+			shutdown = claim.Spec.Lifecycle.ShutdownTime
+			ttl = claim.Spec.Lifecycle.TTLSecondsAfterFinished
+		}
+		finished = lifecycle.FinishedCondition(claim.Status.Conditions, string(sandboxv1beta1.SandboxConditionFinished))
+	}
+	expiresAt := authoritativeExpiry(sandbox, claim)
+	var retentionDeadline *time.Time
+	if ttl != nil && finished != nil {
+		finishedAt := finished.LastTransitionTime.Time
+		deadline := finishedAt.Add(time.Duration(*ttl) * time.Second)
+		retentionDeadline = &deadline
+	}
+	if shutdown == nil && ttl == nil {
+		source = ""
+	}
 	return LifecycleSummary{
-		Source:    "Sandbox",
-		ExpiresAt: &expiresAt,
-		Expired:   !now.Before(expiresAt),
+		Source:                  source,
+		ExpiresAt:               expiresAt,
+		TTLSecondsAfterFinished: ttl,
+		RetentionDeadline:       retentionDeadline,
+		Expired:                 expiresAt != nil && !now.Before(*expiresAt),
+	}
+}
+
+func claimListWarning(err error) string {
+	switch {
+	case apierrors.IsForbidden(err):
+		return "SandboxClaim access forbidden; lifecycle enrichment is unavailable"
+	case apierrors.IsNotFound(err):
+		return "SandboxClaim API is unavailable; lifecycle enrichment is disabled"
+	default:
+		return "SandboxClaim listing failed; lifecycle enrichment is temporarily unavailable"
 	}
 }
 

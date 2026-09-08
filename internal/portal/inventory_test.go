@@ -17,18 +17,24 @@ package portal
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	clienttesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	clientfake "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned/fake"
 	extensionsfake "sigs.k8s.io/agent-sandbox/clients/k8s/extensions/clientset/versioned/fake"
+	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 )
 
 const (
@@ -108,13 +114,155 @@ func TestInventoryProjectsCoreSandboxFields(t *testing.T) {
 	assert.Equal(t, LifecycleSummary{Source: "Sandbox", ExpiresAt: new(shutdownTime.Time)}, record.Lifecycle)
 	assert.Equal(t, []string{"10.0.0.8", "2001:db8::8"}, record.PodIPs)
 	assert.Equal(t, "box-b.team-a.svc.cluster.local", record.ServiceFQDN)
-	assert.Empty(t, record.Connections)
+	assert.Equal(t, []ConnectionRecord{
+		{Kind: "podIP", Label: "Pod IP", Value: "10.0.0.8"},
+		{Kind: "podIP", Label: "Pod IP", Value: "2001:db8::8"},
+		{Kind: "serviceFQDN", Label: "Service FQDN", Value: "box-b.team-a.svc.cluster.local"},
+	}, record.Connections)
 	assert.True(t, record.TerminalEligible)
 
 	record.PodIPs[0] = "modified"
 	record.Containers[0].Ports[0].Port = 1
 	assert.Equal(t, []string{"10.0.0.8", "2001:db8::8"}, sb.Status.PodIPs)
 	assert.EqualValues(t, 8080, sb.Spec.PodTemplate.Spec.Containers[0].Ports[0].ContainerPort)
+}
+
+func TestInventoryClaimLifecycleTakesPrecedence(t *testing.T) {
+	claimShutdown := metav1.NewTime(time.Unix(500, 0))
+	sandboxShutdown := metav1.NewTime(time.Unix(900, 0))
+	claim := claimForSandbox("claim-a", "team-a", "box-a", types.UID("claim-uid"))
+	claim.Spec.Lifecycle = &extensionsv1beta1.Lifecycle{ShutdownTime: &claimShutdown}
+	sb := readySandbox("box-a", "team-a")
+	sb.Spec.ShutdownTime = &sandboxShutdown
+	sb.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: extensionsv1beta1.GroupVersion.String(), Kind: "SandboxClaim", Name: claim.Name, UID: claim.UID, Controller: ptr.To(true),
+	}}
+
+	got := listInventoryWithClaims(t, time.Unix(400, 0), []*sandboxv1beta1.Sandbox{sb}, []*extensionsv1beta1.SandboxClaim{claim})
+
+	require.Equal(t, claimShutdown.Time, *got.Sandboxes[0].Lifecycle.ExpiresAt)
+	assert.Equal(t, "SandboxClaim", got.Sandboxes[0].Lifecycle.Source)
+	assert.Equal(t, "claim-a", got.Sandboxes[0].ClaimName)
+	assert.True(t, got.Sandboxes[0].TerminalEligible)
+}
+
+func TestInventoryDirectLifecycle(t *testing.T) {
+	t.Run("shutdown", func(t *testing.T) {
+		shutdown := metav1.NewTime(time.Unix(500, 0))
+		sb := readySandbox("box-a", "team-a")
+		sb.Spec.ShutdownTime = &shutdown
+
+		record := listInventory(t, "team-a", false, time.Unix(500, 0), sb).Sandboxes[0]
+
+		assert.Equal(t, LifecycleSummary{Source: "Sandbox", ExpiresAt: new(shutdown.Time), Expired: true}, record.Lifecycle)
+		assert.False(t, record.TerminalEligible)
+	})
+
+	t.Run("no lifecycle", func(t *testing.T) {
+		record := listInventory(t, "team-a", false, time.Unix(500, 0), readySandbox("box-a", "team-a")).Sandboxes[0]
+
+		assert.Equal(t, LifecycleSummary{}, record.Lifecycle)
+		assert.True(t, record.TerminalEligible)
+	})
+}
+
+func TestInventoryTTLAfterFinished(t *testing.T) {
+	ttl := int32(60)
+	finishedAt := metav1.NewTime(time.Unix(400, 0))
+	shutdown := metav1.NewTime(time.Unix(900, 0))
+	claim := claimForSandbox("claim-a", "team-a", "box-a", types.UID("claim-uid"))
+	claim.Spec.Lifecycle = &extensionsv1beta1.Lifecycle{
+		ShutdownTime:            &shutdown,
+		TTLSecondsAfterFinished: &ttl,
+	}
+	claim.Status.Conditions = []metav1.Condition{{
+		Type:               string(sandboxv1beta1.SandboxConditionFinished),
+		Status:             metav1.ConditionTrue,
+		LastTransitionTime: finishedAt,
+	}}
+	sb := readySandbox("box-a", "team-a")
+	setClaimOwner(sb, claim)
+
+	record := listInventoryWithClaims(t, time.Unix(470, 0), []*sandboxv1beta1.Sandbox{sb}, []*extensionsv1beta1.SandboxClaim{claim}).Sandboxes[0]
+
+	deadline := time.Unix(460, 0)
+	assert.Equal(t, LifecycleSummary{
+		Source:                  "SandboxClaim",
+		ExpiresAt:               &deadline,
+		TTLSecondsAfterFinished: ptr.To(int32(60)),
+		RetentionDeadline:       &deadline,
+		Expired:                 true,
+	}, record.Lifecycle)
+	assert.False(t, record.TerminalEligible)
+}
+
+func TestInventoryTTLBeforeFinishedShowsPolicyOnly(t *testing.T) {
+	ttl := int32(60)
+	claim := claimForSandbox("claim-a", "team-a", "box-a", types.UID("claim-uid"))
+	claim.Spec.Lifecycle = &extensionsv1beta1.Lifecycle{TTLSecondsAfterFinished: &ttl}
+	claim.Status.Conditions = []metav1.Condition{{
+		Type:   string(sandboxv1beta1.SandboxConditionFinished),
+		Status: metav1.ConditionFalse,
+	}}
+	sb := readySandbox("box-a", "team-a")
+	setClaimOwner(sb, claim)
+
+	record := listInventoryWithClaims(t, time.Unix(470, 0), []*sandboxv1beta1.Sandbox{sb}, []*extensionsv1beta1.SandboxClaim{claim}).Sandboxes[0]
+
+	assert.Equal(t, LifecycleSummary{
+		Source:                  "SandboxClaim",
+		TTLSecondsAfterFinished: ptr.To(int32(60)),
+	}, record.Lifecycle)
+	assert.True(t, record.TerminalEligible)
+}
+
+func TestInventoryClaimWithoutLifecycleOverridesSandboxLifecycle(t *testing.T) {
+	sandboxShutdown := metav1.NewTime(time.Unix(100, 0))
+	claim := claimForSandbox("claim-a", "team-a", "box-a", types.UID("claim-uid"))
+	sb := readySandbox("box-a", "team-a")
+	sb.Spec.ShutdownTime = &sandboxShutdown
+	setClaimOwner(sb, claim)
+
+	record := listInventoryWithClaims(t, time.Unix(400, 0), []*sandboxv1beta1.Sandbox{sb}, []*extensionsv1beta1.SandboxClaim{claim}).Sandboxes[0]
+
+	assert.Equal(t, LifecycleSummary{}, record.Lifecycle)
+	assert.True(t, record.TerminalEligible)
+}
+
+func TestMatchClaimOwnerReferenceWinsOverStatusMatch(t *testing.T) {
+	sb := readySandbox("box-a", "team-a")
+	owner := claimForSandbox("owner", "team-a", "another-box", types.UID("owner-uid"))
+	statusMatch := claimForSandbox("status-match", "team-a", "box-a", types.UID("status-uid"))
+	setClaimOwner(sb, owner)
+
+	got, warning := matchClaim(sb, []extensionsv1beta1.SandboxClaim{*statusMatch, *owner})
+
+	require.NotNil(t, got)
+	assert.Equal(t, owner.Name, got.Name)
+	assert.Empty(t, warning)
+}
+
+func TestMatchClaimUsesSingleStatusMatchInNamespace(t *testing.T) {
+	sb := readySandbox("box-a", "team-a")
+	match := claimForSandbox("match", "team-a", "box-a", types.UID("match-uid"))
+	otherNamespace := claimForSandbox("other", "team-b", "box-a", types.UID("other-uid"))
+
+	got, warning := matchClaim(sb, []extensionsv1beta1.SandboxClaim{*otherNamespace, *match})
+
+	require.NotNil(t, got)
+	assert.Equal(t, match.Name, got.Name)
+	assert.Empty(t, warning)
+}
+
+func TestMatchClaimRejectsAmbiguousStatusMatches(t *testing.T) {
+	sb := readySandbox("box-a", "team-a")
+	first := claimForSandbox("claim-a", "team-a", "box-a", types.UID("first-uid"))
+	second := claimForSandbox("claim-b", "team-a", "box-a", types.UID("second-uid"))
+
+	got, warning := matchClaim(sb, []extensionsv1beta1.SandboxClaim{*first, *second})
+
+	assert.Nil(t, got)
+	assert.Equal(t, "multiple SandboxClaims reference Sandbox team-a/box-a; lifecycle enrichment is unavailable", warning)
 }
 
 func TestInventoryMissingReadyIsUnknown(t *testing.T) {
@@ -283,6 +431,76 @@ func TestInventoryWrapsSandboxListErrors(t *testing.T) {
 	assert.EqualError(t, err, "list Sandboxes: API unavailable")
 }
 
+func TestInventoryClaimListFailuresAreSanitized(t *testing.T) {
+	claimResource := schema.GroupResource{Group: extensionsv1beta1.GroupVersion.Group, Resource: "sandboxclaims"}
+	tests := []struct {
+		name    string
+		err     error
+		warning string
+	}{
+		{
+			name:    "forbidden",
+			err:     apierrors.NewForbidden(claimResource, "", errors.New("credential=forbidden-secret")),
+			warning: "SandboxClaim access forbidden; lifecycle enrichment is unavailable",
+		},
+		{
+			name:    "API unavailable",
+			err:     apierrors.NewNotFound(claimResource, "sandboxclaims"),
+			warning: "SandboxClaim API is unavailable; lifecycle enrichment is disabled",
+		},
+		{
+			name:    "temporary failure",
+			err:     errors.New("response body contains generic-secret"),
+			warning: "SandboxClaim listing failed; lifecycle enrichment is temporarily unavailable",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sandboxClient := newSandboxClientset(t, readySandbox("box-a", "team-a"))
+			claimClient := extensionsfake.NewSimpleClientset()
+			claimClient.PrependReactor("list", "sandboxclaims", func(clienttesting.Action) (bool, runtime.Object, error) {
+				return true, nil, tt.err
+			})
+			inventory := NewInventory(
+				sandboxClient.AgentsV1beta1(),
+				claimClient.ExtensionsV1beta1(),
+				inventoryOptions("team-a", false, time.Unix(200, 0)),
+			)
+
+			got, err := inventory.List(context.Background())
+
+			require.NoError(t, err)
+			require.Len(t, got.Sandboxes, 1)
+			assert.Equal(t, []string{tt.warning}, got.Warnings)
+			assert.NotContains(t, fmt.Sprint(got), "secret")
+		})
+	}
+}
+
+func TestInventoryClaimListFailurePreservesOwnerNameAndDisablesTerminal(t *testing.T) {
+	claim := claimForSandbox("claim-a", "team-a", "box-a", types.UID("claim-uid"))
+	sb := readySandbox("box-a", "team-a")
+	setClaimOwner(sb, claim)
+	sandboxClient := newSandboxClientset(t, sb)
+	claimClient := extensionsfake.NewSimpleClientset()
+	claimClient.PrependReactor("list", "sandboxclaims", func(clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("temporary failure")
+	})
+	inventory := NewInventory(
+		sandboxClient.AgentsV1beta1(),
+		claimClient.ExtensionsV1beta1(),
+		inventoryOptions("team-a", false, time.Unix(200, 0)),
+	)
+
+	got, err := inventory.List(context.Background())
+
+	require.NoError(t, err)
+	require.Len(t, got.Sandboxes, 1)
+	assert.Equal(t, "claim-a", got.Sandboxes[0].ClaimName)
+	assert.False(t, got.Sandboxes[0].TerminalEligible)
+}
+
 func listInventory(
 	t *testing.T,
 	namespace string,
@@ -296,6 +514,29 @@ func listInventory(
 		client.AgentsV1beta1(),
 		extensionsfake.NewSimpleClientset().ExtensionsV1beta1(),
 		inventoryOptions(namespace, allNamespaces, now),
+	)
+	got, err := inventory.List(context.Background())
+	require.NoError(t, err)
+	return got
+}
+
+func listInventoryWithClaims(
+	t *testing.T,
+	now time.Time,
+	sandboxes []*sandboxv1beta1.Sandbox,
+	claims []*extensionsv1beta1.SandboxClaim,
+) InventoryResponse {
+	t.Helper()
+	sandboxClient := newSandboxClientset(t, sandboxes...)
+	claimObjects := make([]runtime.Object, 0, len(claims))
+	for _, claim := range claims {
+		claimObjects = append(claimObjects, claim)
+	}
+	claimClient := extensionsfake.NewSimpleClientset(claimObjects...)
+	inventory := NewInventory(
+		sandboxClient.AgentsV1beta1(),
+		claimClient.ExtensionsV1beta1(),
+		inventoryOptions("team-a", false, now),
 	)
 	got, err := inventory.List(context.Background())
 	require.NoError(t, err)
@@ -333,6 +574,36 @@ func sandboxWithReady(name, namespace string, ready *metav1.Condition) *sandboxv
 		sandbox.Status.Conditions = []metav1.Condition{*ready}
 	}
 	return sandbox
+}
+
+func readySandbox(name, namespace string) *sandboxv1beta1.Sandbox {
+	sandbox := sandboxWithReady(name, namespace, readyCondition(metav1.ConditionTrue))
+	sandbox.Spec.PodTemplate.Spec.Containers = []corev1.Container{{Name: "workspace"}}
+	return sandbox
+}
+
+func claimForSandbox(name, namespace, sandboxName string, uid types.UID) *extensionsv1beta1.SandboxClaim {
+	return &extensionsv1beta1.SandboxClaim{
+		TypeMeta: metav1.TypeMeta{APIVersion: extensionsv1beta1.GroupVersion.String(), Kind: extensionsv1beta1.SandboxClaimKind},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			UID:       uid,
+		},
+		Status: extensionsv1beta1.SandboxClaimStatus{
+			SandboxStatus: extensionsv1beta1.SandboxStatus{Name: sandboxName},
+		},
+	}
+}
+
+func setClaimOwner(sandbox *sandboxv1beta1.Sandbox, claim *extensionsv1beta1.SandboxClaim) {
+	sandbox.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: extensionsv1beta1.GroupVersion.String(),
+		Kind:       extensionsv1beta1.SandboxClaimKind,
+		Name:       claim.Name,
+		UID:        claim.UID,
+		Controller: ptr.To(true),
+	}}
 }
 
 func readyCondition(status metav1.ConditionStatus) *metav1.Condition {
