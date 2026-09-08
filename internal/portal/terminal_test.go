@@ -54,6 +54,7 @@ func TestTerminalResolver(t *testing.T) {
 		wantStatus       int
 		wantMessage      string
 		wantNoAPICalls   bool
+		wantNoPodRead    bool
 		wantWrappedError bool
 	}{
 		{
@@ -261,6 +262,32 @@ func TestTerminalResolver(t *testing.T) {
 			wantWrappedError: true,
 		},
 		{
+			name:        "owner-referenced claim owner UID empty",
+			namespace:   "team-a",
+			sandboxName: "box-a",
+			scope:       TerminalScope{Namespace: "team-a"},
+			mutate: func(f *terminalFixture) {
+				f.addClaim()
+				f.sandbox.OwnerReferences[0].UID = ""
+			},
+			wantStatus:    http.StatusConflict,
+			wantMessage:   "SandboxClaim is unavailable",
+			wantNoPodRead: true,
+		},
+		{
+			name:        "owner-referenced claim fetched UID empty",
+			namespace:   "team-a",
+			sandboxName: "box-a",
+			scope:       TerminalScope{Namespace: "team-a"},
+			mutate: func(f *terminalFixture) {
+				claim := f.addClaim()
+				claim.UID = ""
+			},
+			wantStatus:    http.StatusConflict,
+			wantMessage:   "SandboxClaim is unavailable",
+			wantNoPodRead: true,
+		},
+		{
 			name:        "owner-referenced claim UID mismatch",
 			namespace:   "team-a",
 			sandboxName: "box-a",
@@ -455,6 +482,9 @@ func TestTerminalResolver(t *testing.T) {
 			if tt.wantNoAPICalls {
 				assert.Empty(t, sandboxClient.Actions())
 				assert.Empty(t, claimClient.Actions())
+				assert.Empty(t, podClient.Actions())
+			}
+			if tt.wantNoPodRead {
 				assert.Empty(t, podClient.Actions())
 			}
 		})
