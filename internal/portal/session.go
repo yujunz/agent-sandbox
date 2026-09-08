@@ -19,8 +19,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -128,7 +130,19 @@ func sameOrigin(r *http.Request) bool {
 	if err != nil || (origin.Scheme != "http" && origin.Scheme != "https") || origin.Host != r.Host {
 		return false
 	}
-	return origin.User == nil && origin.Path == "" && origin.RawQuery == "" && origin.Fragment == ""
+	return origin.User == nil && origin.Path == "" && origin.RawQuery == "" && origin.Fragment == "" &&
+		loopbackHostname(origin.Hostname())
+}
+
+func loopbackHostname(hostname string) bool {
+	if hostname == "" {
+		return false
+	}
+	if strings.EqualFold(hostname, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(hostname)
+	return ip != nil && ip.IsLoopback()
 }
 
 type terminalClientResult int
@@ -140,7 +154,7 @@ const (
 
 func runTerminalSession(
 	rootContext context.Context,
-	conn *websocket.Conn,
+	conn webSocketConnection,
 	executor remotecommand.Executor,
 	target TerminalTarget,
 	log logr.Logger,
@@ -149,7 +163,16 @@ func runTerminalSession(
 	stdinReader, stdinWriter := io.Pipe()
 	input := make(chan []byte, terminalInputQueueSize)
 	resizes := newResizeQueue()
-	writer := &serializedWebSocketWriter{conn: conn}
+	writer := &serializedWebSocketWriter{conn: conn, now: time.Now}
+	var cleanupOnce sync.Once
+	cleanupSession := func() {
+		cleanupOnce.Do(func() {
+			cancel()
+			_ = stdinWriter.Close()
+			_ = stdinReader.Close()
+			resizes.Close()
+		})
+	}
 
 	conn.SetReadLimit(terminalControlReadLimit)
 	_ = conn.SetReadDeadline(time.Now().Add(terminalPongTimeout))
@@ -174,10 +197,7 @@ func runTerminalSession(
 	pingTicker := time.NewTicker(terminalPingInterval)
 	defer pingTicker.Stop()
 	defer func() {
-		cancel()
-		_ = stdinWriter.Close()
-		_ = stdinReader.Close()
-		resizes.Close()
+		cleanupSession()
 		_ = conn.Close()
 	}()
 
@@ -185,6 +205,7 @@ func runTerminalSession(
 		select {
 		case err := <-execResult:
 			result := "clean-exit"
+			cleanupSession()
 			if err == nil {
 				_ = writer.WriteJSON(ServerControl{Type: "exit"})
 			} else if errors.Is(err, context.Canceled) {
@@ -196,32 +217,23 @@ func runTerminalSession(
 			logTerminalResult(log, target, result)
 			return
 		case result := <-clientResult:
+			cleanupSession()
 			if result == terminalClientInvalidControl {
 				_ = writer.WriteJSON(ServerControl{Type: "error", Message: invalidTerminalControlMessage})
 			}
-			cancel()
-			_ = stdinWriter.Close()
-			_ = stdinReader.Close()
-			resizes.Close()
 			_ = conn.Close()
 			<-execResult
 			logTerminalResult(log, target, "disconnect")
 			return
 		case <-rootContext.Done():
-			cancel()
-			_ = stdinWriter.Close()
-			_ = stdinReader.Close()
-			resizes.Close()
+			cleanupSession()
 			_ = conn.Close()
 			<-execResult
 			logTerminalResult(log, target, "cancelled")
 			return
 		case <-pingTicker.C:
 			if err := writer.WritePing(); err != nil {
-				cancel()
-				_ = stdinWriter.Close()
-				_ = stdinReader.Close()
-				resizes.Close()
+				cleanupSession()
 				_ = conn.Close()
 				<-execResult
 				logTerminalResult(log, target, "disconnect")
@@ -232,7 +244,7 @@ func runTerminalSession(
 }
 
 func readTerminalControls(
-	conn *websocket.Conn,
+	conn webSocketConnection,
 	input chan<- []byte,
 	resizes *resizeQueue,
 	result chan<- terminalClientResult,
@@ -304,26 +316,57 @@ func reportTerminalClientResult(result chan<- terminalClientResult, value termin
 }
 
 type serializedWebSocketWriter struct {
-	conn *websocket.Conn
+	conn webSocketWriteConnection
+	now  func() time.Time
 	mu   sync.Mutex
 }
 
+type webSocketWriteConnection interface {
+	SetWriteDeadline(time.Time) error
+	WriteMessage(int, []byte) error
+	WriteJSON(any) error
+	WriteControl(int, []byte, time.Time) error
+}
+
+type webSocketConnection interface {
+	webSocketWriteConnection
+	SetReadLimit(int64)
+	SetReadDeadline(time.Time) error
+	SetPongHandler(func(string) error)
+	ReadMessage() (int, []byte, error)
+	Close() error
+}
+
 func (w *serializedWebSocketWriter) WriteMessage(messageType int, payload []byte) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.conn.WriteMessage(messageType, payload)
+	return w.write(func(time.Time) error {
+		return w.conn.WriteMessage(messageType, payload)
+	})
 }
 
 func (w *serializedWebSocketWriter) WriteJSON(control ServerControl) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.conn.WriteJSON(control)
+	return w.write(func(time.Time) error {
+		return w.conn.WriteJSON(control)
+	})
 }
 
 func (w *serializedWebSocketWriter) WritePing() error {
+	return w.write(func(deadline time.Time) error {
+		return w.conn.WriteControl(websocket.PingMessage, nil, deadline)
+	})
+}
+
+func (w *serializedWebSocketWriter) write(write func(time.Time) error) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(terminalWriteTimeout))
+	now := w.now
+	if now == nil {
+		now = time.Now
+	}
+	deadline := now().Add(terminalWriteTimeout)
+	if err := w.conn.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	return write(deadline)
 }
 
 type websocketOutput struct {

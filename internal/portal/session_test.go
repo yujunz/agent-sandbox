@@ -114,6 +114,51 @@ func TestTerminalRejectsMissingCrossOriginAndMalformedOriginBeforeUpgrade(t *tes
 	}
 }
 
+func TestTerminalRejectsMatchingNonLoopbackHostAndOriginBeforeResolution(t *testing.T) {
+	fixture := newTerminalFixture()
+	resolver, sandboxClient, claimClient, podClient := fixture.resolver(t, TerminalScope{Namespace: "team-a"}, time.Unix(500, 0))
+	factoryCalled := false
+	terminal := NewTerminalHandler(t.Context(), resolver, executorFactoryFunc(func(ExecRequest) (remotecommand.Executor, error) {
+		factoryCalled = true
+		return nil, errors.New("must not be called")
+	}), logr.Discard())
+	server := newHTTPTestServer(t, ServerOptions{Terminal: terminal})
+	req, err := http.NewRequestWithContext(
+		t.Context(),
+		http.MethodGet,
+		server.URL+"/api/v1/namespaces/team-a/sandboxes/box-a/terminal",
+		nil,
+	)
+	require.NoError(t, err)
+	req.Host = "attacker.example:8080"
+	req.Header.Set("Origin", "http://attacker.example:8080")
+
+	response, err := server.Client().Do(req)
+	require.NoError(t, err)
+	defer response.Body.Close()
+
+	assert.Equal(t, http.StatusForbidden, response.StatusCode)
+	assert.Empty(t, sandboxClient.Actions())
+	assert.Empty(t, claimClient.Actions())
+	assert.Empty(t, podClient.Actions())
+	assert.False(t, factoryCalled)
+}
+
+func TestSameOriginAllowsLoopbackAuthorities(t *testing.T) {
+	for _, authority := range []string{
+		"localhost:8080",
+		"LOCALHOST:8080",
+		"127.0.0.1:8080",
+		"[::1]:8080",
+	} {
+		t.Run(authority, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "http://"+authority+"/terminal", nil)
+			req.Header.Set("Origin", "http://"+authority)
+			assert.True(t, sameOrigin(req))
+		})
+	}
+}
+
 func TestTerminalRejectsOversizedAndUnknownControlMessages(t *testing.T) {
 	executor := executorFunc(func(ctx context.Context, _ remotecommand.StreamOptions) error {
 		<-ctx.Done()
@@ -212,8 +257,10 @@ func TestTerminalDisconnectCancelsExec(t *testing.T) {
 func TestTerminalServerShutdownCancelsExec(t *testing.T) {
 	serverContext, cancelServer := context.WithCancel(context.Background())
 	t.Cleanup(cancelServer)
+	started := make(chan struct{})
 	cancelled := make(chan struct{})
 	executor := executorFunc(func(ctx context.Context, _ remotecommand.StreamOptions) error {
+		close(started)
 		<-ctx.Done()
 		close(cancelled)
 		return ctx.Err()
@@ -221,14 +268,79 @@ func TestTerminalServerShutdownCancelsExec(t *testing.T) {
 	server := newTerminalTestServer(t, serverContext, executorFactoryFunc(func(ExecRequest) (remotecommand.Executor, error) {
 		return executor, nil
 	}), logr.Discard())
-	_ = dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "team-a", "box-a", "workspace", "")
+	conn := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "team-a", "box-a", "workspace", "")
 
+	<-started
+	require.NoError(t, conn.WriteJSON(ClientControl{Type: "input", Data: "blocked input"}))
 	cancelServer()
 	select {
 	case <-cancelled:
 	case <-time.After(2 * time.Second):
 		t.Fatal("exec context was not cancelled after server shutdown")
 	}
+}
+
+func TestSerializedWebSocketWriterSetsDeadlineForEveryWrite(t *testing.T) {
+	fixedNow := time.Unix(1_000, 0)
+	deadline := fixedNow.Add(terminalWriteTimeout)
+	connection := &recordingWebSocketWriter{}
+	writer := &serializedWebSocketWriter{
+		conn: connection,
+		now:  func() time.Time { return fixedNow },
+	}
+
+	require.NoError(t, writer.WriteMessage(websocket.BinaryMessage, []byte("output")))
+	assert.Equal(t, []writerCall{
+		{operation: "deadline", deadline: deadline},
+		{operation: "message", messageType: websocket.BinaryMessage},
+	}, connection.takeCalls())
+
+	require.NoError(t, writer.WriteJSON(ServerControl{Type: "exit"}))
+	assert.Equal(t, []writerCall{
+		{operation: "deadline", deadline: deadline},
+		{operation: "json"},
+	}, connection.takeCalls())
+
+	require.NoError(t, writer.WritePing())
+	assert.Equal(t, []writerCall{
+		{operation: "deadline", deadline: deadline},
+		{operation: "control", messageType: websocket.PingMessage, deadline: deadline},
+	}, connection.takeCalls())
+}
+
+func TestSerializedWebSocketWriterReturnsDeadlineErrorWithoutWriting(t *testing.T) {
+	deadlineErr := errors.New("deadline unavailable")
+	connection := &recordingWebSocketWriter{deadlineErr: deadlineErr}
+	writer := &serializedWebSocketWriter{
+		conn: connection,
+		now:  func() time.Time { return time.Unix(1_000, 0) },
+	}
+
+	err := writer.WriteMessage(websocket.BinaryMessage, []byte("output"))
+	require.ErrorIs(t, err, deadlineErr)
+	assert.Equal(t, []writerCall{{operation: "deadline", deadline: time.Unix(1_000, 0).Add(terminalWriteTimeout)}}, connection.takeCalls())
+}
+
+func TestTerminalExecCompletionCancelsBeforeExitWrite(t *testing.T) {
+	streamContext := make(chan context.Context, 1)
+	executor := executorFunc(func(ctx context.Context, _ remotecommand.StreamOptions) error {
+		streamContext <- ctx
+		return nil
+	})
+	connection := newRecordingSessionConnection()
+	connection.beforeJSON = func(any) {
+		connection.cancelledBeforeJSON = (<-streamContext).Err() != nil
+	}
+
+	runTerminalSession(context.Background(), connection, executor, TerminalTarget{
+		Namespace:   "team-a",
+		SandboxName: "box-a",
+		PodName:     "adopted-pod",
+		Container:   "workspace",
+	}, logr.Discard())
+
+	assert.True(t, connection.cancelledBeforeJSON)
+	assert.Equal(t, []ServerControl{{Type: "exit"}}, connection.controls)
 }
 
 func TestTerminalSessionsAreIndependent(t *testing.T) {
@@ -287,6 +399,85 @@ func (f executorFunc) Stream(options remotecommand.StreamOptions) error {
 
 func (f executorFunc) StreamWithContext(ctx context.Context, options remotecommand.StreamOptions) error {
 	return f(ctx, options)
+}
+
+type writerCall struct {
+	operation   string
+	messageType int
+	deadline    time.Time
+}
+
+type recordingWebSocketWriter struct {
+	deadlineErr error
+	calls       []writerCall
+}
+
+func (w *recordingWebSocketWriter) SetWriteDeadline(deadline time.Time) error {
+	w.calls = append(w.calls, writerCall{operation: "deadline", deadline: deadline})
+	return w.deadlineErr
+}
+
+func (w *recordingWebSocketWriter) WriteMessage(messageType int, _ []byte) error {
+	w.calls = append(w.calls, writerCall{operation: "message", messageType: messageType})
+	return nil
+}
+
+func (w *recordingWebSocketWriter) WriteJSON(any) error {
+	w.calls = append(w.calls, writerCall{operation: "json"})
+	return nil
+}
+
+func (w *recordingWebSocketWriter) WriteControl(messageType int, _ []byte, deadline time.Time) error {
+	w.calls = append(w.calls, writerCall{operation: "control", messageType: messageType, deadline: deadline})
+	return nil
+}
+
+func (w *recordingWebSocketWriter) takeCalls() []writerCall {
+	calls := w.calls
+	w.calls = nil
+	return calls
+}
+
+type recordingSessionConnection struct {
+	recordingWebSocketWriter
+	closed              chan struct{}
+	closeOnce           sync.Once
+	beforeJSON          func(any)
+	cancelledBeforeJSON bool
+	controls            []ServerControl
+}
+
+func newRecordingSessionConnection() *recordingSessionConnection {
+	return &recordingSessionConnection{closed: make(chan struct{})}
+}
+
+func (c *recordingSessionConnection) SetReadLimit(int64) {}
+
+func (c *recordingSessionConnection) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (c *recordingSessionConnection) SetPongHandler(func(string) error) {}
+
+func (c *recordingSessionConnection) ReadMessage() (int, []byte, error) {
+	<-c.closed
+	return 0, nil, websocket.ErrCloseSent
+}
+
+func (c *recordingSessionConnection) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *recordingSessionConnection) WriteJSON(value any) error {
+	if c.beforeJSON != nil {
+		c.beforeJSON(value)
+	}
+	control, ok := value.(ServerControl)
+	if ok {
+		c.controls = append(c.controls, control)
+	}
+	return c.recordingWebSocketWriter.WriteJSON(value)
 }
 
 func newTerminalTestServer(t *testing.T, rootContext context.Context, factory ExecutorFactory, logger logr.Logger) *httptest.Server {
