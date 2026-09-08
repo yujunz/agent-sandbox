@@ -85,3 +85,17 @@ type ConnectionRecord struct {
 	Container string `json:"container,omitempty"`
 	Port      int32  `json:"port,omitempty"`
 }
+
+// ClientControl is a bounded browser-to-terminal protocol message.
+type ClientControl struct {
+	Type string `json:"type"`
+	Data string `json:"data,omitempty"`
+	Cols uint16 `json:"cols,omitempty"`
+	Rows uint16 `json:"rows,omitempty"`
+}
+
+// ServerControl reports terminal lifecycle events to the browser.
+type ServerControl struct {
+	Type    string `json:"type"`
+	Message string `json:"message,omitempty"`
+}

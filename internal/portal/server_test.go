@@ -28,8 +28,12 @@ import (
 	"github.com/go-logr/logr/funcr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	clienttesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/remotecommand"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	extensionsfake "sigs.k8s.io/agent-sandbox/clients/k8s/extensions/clientset/versioned/fake"
 )
 
@@ -222,6 +226,35 @@ func TestServerTerminalRouteUsesConfiguredHandler(t *testing.T) {
 	assert.Equal(t, http.StatusMethodNotAllowed, response.StatusCode)
 	assert.Equal(t, http.MethodGet, response.Header.Get("Allow"))
 	assert.True(t, strings.HasPrefix(response.Header.Get("Content-Type"), "application/json"))
+}
+
+func TestServerTerminalResolutionErrorIsSanitized(t *testing.T) {
+	fixture := newTerminalFixture()
+	resolver, sandboxClient, _, _ := fixture.resolver(t, TerminalScope{Namespace: "team-a"}, time.Unix(500, 0))
+	sandboxClient.PrependReactor("get", "sandboxes", terminalErrorReactor(apierrors.NewForbidden(
+		schema.GroupResource{Group: sandboxv1beta1.GroupVersion.Group, Resource: "sandboxes"},
+		"box-a",
+		errors.New("raw API body token=credential"),
+	)))
+	factory := executorFactoryFunc(func(ExecRequest) (remotecommand.Executor, error) {
+		return nil, errors.New("executor must not be created")
+	})
+	terminal := NewTerminalHandler(t.Context(), resolver, factory, logr.Discard())
+	server := newHTTPTestServer(t, ServerOptions{Terminal: terminal})
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL+"/api/v1/namespaces/team-a/sandboxes/box-a/terminal", nil)
+	require.NoError(t, err)
+	req.Header.Set("Origin", terminalOrigin(t, server.URL))
+
+	response, err := server.Client().Do(req)
+	require.NoError(t, err)
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+
+	assert.Equal(t, http.StatusForbidden, response.StatusCode)
+	assert.JSONEq(t, `{"error":"Sandbox access forbidden"}`, string(body))
+	assert.NotContains(t, string(body), "credential")
+	assert.NotContains(t, string(body), "raw API body")
 }
 
 func TestServerRejectsMissingInventory(t *testing.T) {
