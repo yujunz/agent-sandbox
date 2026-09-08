@@ -35,6 +35,40 @@ import (
 
 const testContentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
 
+const htmlLicenseHeader = `<!--
+ Copyright 2026 The Kubernetes Authors.
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+-->
+`
+
+const blockLicenseHeader = `/*
+ Copyright 2026 The Kubernetes Authors.
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+*/
+`
+
 func TestServerRoutes(t *testing.T) {
 	tests := []struct {
 		method      string
@@ -211,6 +245,29 @@ func TestServerShellUsesExternalAssets(t *testing.T) {
 	assert.NotContains(t, html, "<script>")
 	assert.Contains(t, html, `aria-live="polite"`)
 	assert.Contains(t, html, `id="terminal-drawer"`)
+}
+
+func TestServerFirstPartyAssetsHaveLicenseHeaders(t *testing.T) {
+	server := newHTTPTestServer(t, ServerOptions{})
+	tests := []struct {
+		path       string
+		wantHeader string
+	}{
+		{"/", htmlLicenseHeader},
+		{"/app.css", blockLicenseHeader},
+		{"/app.js", blockLicenseHeader},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			response := request(t, server, http.MethodGet, tt.path)
+			defer response.Body.Close()
+			body, err := io.ReadAll(response.Body)
+			require.NoError(t, err)
+
+			assert.True(t, strings.HasPrefix(string(body), tt.wantHeader), "asset %s must begin with the repository license header", tt.path)
+		})
+	}
 }
 
 func newHTTPTestServer(t *testing.T, opts ServerOptions) *httptest.Server {
