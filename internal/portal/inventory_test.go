@@ -229,6 +229,23 @@ func TestInventoryClaimWithoutLifecycleOverridesSandboxLifecycle(t *testing.T) {
 	assert.True(t, record.TerminalEligible)
 }
 
+func TestInventoryClaimOwnerMissingDoesNotFallBackToStatusMatch(t *testing.T) {
+	owner := claimForSandbox("owner", "team-a", "box-a", types.UID("owner-uid"))
+	statusMatch := claimForSandbox("status-match", "team-a", "box-a", types.UID("status-uid"))
+	sb := readySandbox("box-a", "team-a")
+	setClaimOwner(sb, owner)
+
+	record := listInventoryWithClaims(
+		t,
+		time.Unix(400, 0),
+		[]*sandboxv1beta1.Sandbox{sb},
+		[]*extensionsv1beta1.SandboxClaim{statusMatch},
+	).Sandboxes[0]
+
+	assert.Equal(t, "owner", record.ClaimName)
+	assert.False(t, record.TerminalEligible)
+}
+
 func TestMatchClaimOwnerReferenceWinsOverStatusMatch(t *testing.T) {
 	sb := readySandbox("box-a", "team-a")
 	owner := claimForSandbox("owner", "team-a", "another-box", types.UID("owner-uid"))

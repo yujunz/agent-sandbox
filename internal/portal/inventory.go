@@ -102,7 +102,7 @@ func (i *Inventory) List(ctx context.Context) (InventoryResponse, error) {
 				warnings = append(warnings, warning)
 			}
 		}
-		records = append(records, i.projectSandbox(&list.Items[idx], claim, claimDataAvailable, now))
+		records = append(records, i.projectSandbox(&list.Items[idx], claim, now))
 	}
 	slices.SortFunc(records, func(left, right SandboxRecord) int {
 		if namespaceOrder := cmp.Compare(left.Namespace, right.Namespace); namespaceOrder != 0 {
@@ -124,7 +124,6 @@ func (i *Inventory) List(ctx context.Context) (InventoryResponse, error) {
 func (i *Inventory) projectSandbox(
 	sandbox *sandboxv1beta1.Sandbox,
 	claim *extensionsv1beta1.SandboxClaim,
-	claimDataAvailable bool,
 	now time.Time,
 ) SandboxRecord {
 	ready := summarizeReady(sandbox.Status.Conditions)
@@ -137,12 +136,10 @@ func (i *Inventory) projectSandbox(
 	claimName := ""
 	if claim != nil {
 		claimName = claim.Name
-	} else if !claimDataAvailable {
-		if owner := claimControllerOwner(sandbox); owner != nil {
-			claimName = owner.Name
-		}
+	} else if owner := claimControllerOwner(sandbox); owner != nil {
+		claimName = owner.Name
 	}
-	claimLifecycleUnavailable := !claimDataAvailable && claimName != ""
+	claimLifecycleUnavailable := claim == nil && claimName != ""
 	return SandboxRecord{
 		Namespace:        sandbox.Namespace,
 		Name:             sandbox.Name,
@@ -184,6 +181,7 @@ func matchClaim(sandbox *sandboxv1beta1.Sandbox, claims []extensionsv1beta1.Sand
 				return claim, ""
 			}
 		}
+		return nil, ""
 	}
 
 	var matched *extensionsv1beta1.SandboxClaim
