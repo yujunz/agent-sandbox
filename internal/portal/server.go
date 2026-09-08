@@ -29,7 +29,8 @@ import (
 	"github.com/go-logr/logr"
 )
 
-const contentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+// xterm.js creates runtime style elements and style attributes; scripts remain restricted to self-hosted assets.
+const contentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
 
 //go:embed web
 var embeddedWeb embed.FS

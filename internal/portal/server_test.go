@@ -39,7 +39,7 @@ import (
 	extensionsfake "sigs.k8s.io/agent-sandbox/clients/k8s/extensions/clientset/versioned/fake"
 )
 
-const testContentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+const testContentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
 
 const htmlLicenseHeader = `<!--
  Copyright 2026 The Kubernetes Authors.
@@ -136,6 +136,22 @@ func TestServerSecurityHeaders(t *testing.T) {
 			assert.Equal(t, "DENY", response.Header.Get("X-Frame-Options"))
 		})
 	}
+}
+
+func TestServerCSPAllowsXtermRuntimeStylesWithoutInlineScripts(t *testing.T) {
+	server := newHTTPTestServer(t, ServerOptions{})
+	response := request(t, server, http.MethodGet, "/")
+	defer response.Body.Close()
+
+	csp := response.Header.Get("Content-Security-Policy")
+	assert.Contains(t, csp, "style-src 'self' 'unsafe-inline';")
+	assert.Contains(t, csp, "script-src 'self';")
+	assert.NotContains(t, csp, "script-src 'self' 'unsafe-inline'")
+	assert.NotContains(t, csp, "script-src 'self' 'unsafe-eval'")
+
+	xterm, err := fs.ReadFile(embeddedWeb, "web/vendor/xterm.js")
+	require.NoError(t, err)
+	assert.Contains(t, string(xterm), `createElement("style")`, "xterm's DOM renderer requires the narrow inline-style exception")
 }
 
 func TestInventoryResponseNoStore(t *testing.T) {
@@ -369,6 +385,33 @@ func TestPortalJavaScriptContract(t *testing.T) {
 	assert.NotContains(t, javascript, ".innerHTML")
 	assert.NotContains(t, javascript, ".outerHTML")
 	assert.NotContains(t, javascript, "insertAdjacentHTML")
+}
+
+func TestPortalJavaScriptAccessibilityContract(t *testing.T) {
+	body, err := fs.ReadFile(embeddedWeb, "web/app.js")
+	require.NoError(t, err)
+	javascript := string(body)
+
+	for _, contract := range []string{
+		"terminalFocusFrame",
+		"window.cancelAnimationFrame(terminalFocusFrame)",
+		"if (terminal && !elements.drawer.hidden)",
+		"terminalReturnTarget",
+		"button.dataset.terminalNamespace",
+		"button.dataset.terminalName",
+		"function trapTerminalFocus(event)",
+		"function keepTerminalFocus(event)",
+		`document.addEventListener("keydown", trapTerminalFocus)`,
+		`document.removeEventListener("keydown", trapTerminalFocus)`,
+		`document.addEventListener("focusin", keepTerminalFocus)`,
+		`document.removeEventListener("focusin", keepTerminalFocus)`,
+		`button.setAttribute("aria-describedby", reason.id)`,
+		`createElement("span", "terminal-unavailable-reason", unavailable)`,
+		"cell.append(button, reason)",
+	} {
+		assert.Contains(t, javascript, contract)
+	}
+	assert.NotContains(t, javascript, "terminalReturnFocus")
 }
 
 func TestServerFirstPartyAssetsHaveLicenseHeaders(t *testing.T) {

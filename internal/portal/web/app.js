@@ -49,7 +49,9 @@
   let fitAddon = null;
   let terminalDataHandler = null;
   let terminalResizeHandler = null;
-  let terminalReturnFocus = null;
+  let terminalReturnTarget = null;
+  let terminalFocusFrame = null;
+  let terminalReasonSequence = 0;
 
   function createElement(tagName, className, text) {
     const node = document.createElement(tagName);
@@ -294,16 +296,23 @@
   function appendActions(cell, record) {
     const button = createElement("button", "button primary", "Terminal");
     button.type = "button";
+    button.dataset.terminalNamespace = record.namespace;
+    button.dataset.terminalName = record.name;
     const unavailable = terminalUnavailableReason(record);
     if (unavailable) {
+      terminalReasonSequence += 1;
+      const reason = createElement("span", "terminal-unavailable-reason", unavailable);
+      reason.id = `terminal-unavailable-reason-${terminalReasonSequence}`;
       button.disabled = true;
       button.title = unavailable;
       button.setAttribute("aria-label", unavailable);
+      button.setAttribute("aria-describedby", reason.id);
+      cell.append(button, reason);
     } else {
       button.setAttribute("aria-label", `Open terminal for ${record.namespace}/${record.name}`);
       button.addEventListener("click", () => openTerminal(record));
+      cell.append(button);
     }
-    cell.append(button);
   }
 
   function renderRecord(record) {
@@ -503,7 +512,72 @@
     };
   }
 
+  function cancelTerminalFocusFrame() {
+    if (terminalFocusFrame !== null) {
+      window.cancelAnimationFrame(terminalFocusFrame);
+      terminalFocusFrame = null;
+    }
+  }
+
+  function restoreTerminalFocus() {
+    if (!terminalReturnTarget) {
+      return;
+    }
+    const opener = Array.from(elements.rows.querySelectorAll("button[data-terminal-namespace][data-terminal-name]"))
+      .find((button) => button.dataset.terminalNamespace === terminalReturnTarget.namespace
+        && button.dataset.terminalName === terminalReturnTarget.name);
+    if (opener && !opener.disabled) {
+      opener.focus();
+    } else {
+      elements.refresh.focus();
+    }
+    terminalReturnTarget = null;
+  }
+
+  function trapTerminalFocus(event) {
+    if (elements.drawer.hidden) {
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeTerminal();
+      return;
+    }
+    if (event.key !== "Tab") {
+      return;
+    }
+
+    const focusable = Array.from(elements.drawer.querySelectorAll(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+    )).filter((element) => !element.hidden);
+    if (focusable.length === 0) {
+      event.preventDefault();
+      elements.drawer.focus();
+      return;
+    }
+
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (!elements.drawer.contains(document.activeElement)) {
+      event.preventDefault();
+      first.focus();
+    } else if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
+  function keepTerminalFocus(event) {
+    if (!elements.drawer.hidden && !elements.drawer.contains(event.target)) {
+      elements.closeTerminal.focus();
+    }
+  }
+
   function closeTerminal() {
+    cancelTerminalFocusFrame();
     disconnectTerminalSocket();
     if (terminalDataHandler) {
       terminalDataHandler.dispose();
@@ -514,6 +588,8 @@
       terminalResizeHandler = null;
     }
     window.removeEventListener("resize", fitTerminal);
+    document.removeEventListener("keydown", trapTerminalFocus);
+    document.removeEventListener("focusin", keepTerminalFocus);
     if (terminal) {
       terminal.clear();
       terminal.dispose();
@@ -526,10 +602,7 @@
     elements.terminalIdentity.textContent = "";
     elements.drawer.hidden = true;
     setTerminalStatus("Disconnected", "disconnected");
-    if (terminalReturnFocus && typeof terminalReturnFocus.focus === "function") {
-      terminalReturnFocus.focus();
-    }
-    terminalReturnFocus = null;
+    restoreTerminalFocus();
   }
 
   function openTerminal(record) {
@@ -537,9 +610,8 @@
     if (containers.length === 0) {
       return;
     }
-    const returnFocus = document.activeElement;
     closeTerminal();
-    terminalReturnFocus = returnFocus;
+    terminalReturnTarget = { namespace: record.namespace, name: record.name };
     activeRecord = record;
     elements.terminalIdentity.textContent = `${record.namespace}/${record.name}`;
     containers.forEach((container) => {
@@ -568,9 +640,15 @@
       sendTerminalControl({ type: "resize", cols, rows });
     });
     window.addEventListener("resize", fitTerminal);
-    window.requestAnimationFrame(() => {
-      fitTerminal();
-      terminal.focus();
+    document.addEventListener("keydown", trapTerminalFocus);
+    document.addEventListener("focusin", keepTerminalFocus);
+    elements.closeTerminal.focus();
+    terminalFocusFrame = window.requestAnimationFrame(() => {
+      terminalFocusFrame = null;
+      if (terminal && !elements.drawer.hidden) {
+        fitTerminal();
+        terminal.focus();
+      }
     });
     connectTerminal(record, containers[0].name);
   }
@@ -592,11 +670,6 @@
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) {
       fetchInventory();
-    }
-  });
-  document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !elements.drawer.hidden) {
-      closeTerminal();
     }
   });
   window.addEventListener("beforeunload", closeTerminal);

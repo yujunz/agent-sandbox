@@ -198,6 +198,15 @@ select {
   color: #5e6b78;
 }
 
+.terminal-unavailable-reason {
+  color: #66788a;
+  display: block;
+  font-size: 0.72rem;
+  line-height: 1.35;
+  margin-top: 0.4rem;
+  max-width: 13rem;
+}
+
 .button.secondary {
   background: #edf2f6;
   border-color: #becbd7;
