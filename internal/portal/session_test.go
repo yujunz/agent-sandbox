@@ -55,11 +55,11 @@ func TestTerminalSessionBridgesInputOutputAndResize(t *testing.T) {
 		_, err = options.Stdout.Write([]byte("ready\r\n"))
 		return err
 	})
-	server := newTerminalTestServer(t, t.Context(), executorFactoryFunc(func(request ExecRequest) (remotecommand.Executor, error) {
+	server := newTerminalTestServer(t.Context(), t, executorFactoryFunc(func(request ExecRequest) (remotecommand.Executor, error) {
 		requestReceived <- request
 		return executor, nil
 	}), logr.Discard())
-	conn := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "team-a", "box-a", "workspace", "user-command")
+	conn := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "user-command")
 
 	require.NoError(t, conn.WriteJSON(ClientControl{Type: "resize", Cols: 120, Rows: 40}))
 	require.NoError(t, conn.WriteJSON(ClientControl{Type: "input", Data: "echo ready\n"}))
@@ -164,12 +164,12 @@ func TestTerminalRejectsOversizedAndUnknownControlMessages(t *testing.T) {
 		<-ctx.Done()
 		return ctx.Err()
 	})
-	server := newTerminalTestServer(t, t.Context(), executorFactoryFunc(func(ExecRequest) (remotecommand.Executor, error) {
+	server := newTerminalTestServer(t.Context(), t, executorFactoryFunc(func(ExecRequest) (remotecommand.Executor, error) {
 		return executor, nil
 	}), logr.Discard())
 
 	t.Run("oversized", func(t *testing.T) {
-		conn := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "team-a", "box-a", "workspace", "")
+		conn := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "")
 		require.NoError(t, conn.WriteMessage(websocket.TextMessage, []byte(strings.Repeat("x", 65*1024))))
 		_, _, err := conn.ReadMessage()
 		var closeError *websocket.CloseError
@@ -178,7 +178,7 @@ func TestTerminalRejectsOversizedAndUnknownControlMessages(t *testing.T) {
 	})
 
 	t.Run("unknown", func(t *testing.T) {
-		conn := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "team-a", "box-a", "workspace", "")
+		conn := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "")
 		require.NoError(t, conn.WriteJSON(ClientControl{Type: "launch", Data: "user-command"}))
 		assertServerControl(t, conn, ServerControl{Type: "error", Message: "invalid terminal control message"})
 	})
@@ -189,10 +189,10 @@ func TestTerminalUsesBinaryFramesForOutputAndJSONForExit(t *testing.T) {
 		_, err := options.Stdout.Write([]byte{0, 1, 2, '\n'})
 		return err
 	})
-	server := newTerminalTestServer(t, t.Context(), executorFactoryFunc(func(ExecRequest) (remotecommand.Executor, error) {
+	server := newTerminalTestServer(t.Context(), t, executorFactoryFunc(func(ExecRequest) (remotecommand.Executor, error) {
 		return executor, nil
 	}), logr.Discard())
-	conn := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "team-a", "box-a", "workspace", "")
+	conn := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "")
 
 	messageType, output, err := conn.ReadMessage()
 	require.NoError(t, err)
@@ -212,10 +212,10 @@ func TestTerminalStreamErrorSendsSafeControlMessage(t *testing.T) {
 	executor := executorFunc(func(context.Context, remotecommand.StreamOptions) error {
 		return errors.New("remote stream leaked token=credential and workload output")
 	})
-	server := newTerminalTestServer(t, t.Context(), executorFactoryFunc(func(ExecRequest) (remotecommand.Executor, error) {
+	server := newTerminalTestServer(t.Context(), t, executorFactoryFunc(func(ExecRequest) (remotecommand.Executor, error) {
 		return executor, nil
 	}), logger)
-	conn := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "team-a", "box-a", "workspace", "")
+	conn := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "")
 
 	assertServerControl(t, conn, ServerControl{Type: "error", Message: "terminal session ended"})
 	select {
@@ -239,10 +239,10 @@ func TestTerminalDisconnectCancelsExec(t *testing.T) {
 		close(cancelled)
 		return ctx.Err()
 	})
-	server := newTerminalTestServer(t, t.Context(), executorFactoryFunc(func(ExecRequest) (remotecommand.Executor, error) {
+	server := newTerminalTestServer(t.Context(), t, executorFactoryFunc(func(ExecRequest) (remotecommand.Executor, error) {
 		return executor, nil
 	}), logr.Discard())
-	conn := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "team-a", "box-a", "workspace", "")
+	conn := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "")
 
 	<-started
 	require.NoError(t, conn.WriteJSON(ClientControl{Type: "input", Data: "blocked input"}))
@@ -265,10 +265,10 @@ func TestTerminalServerShutdownCancelsExec(t *testing.T) {
 		close(cancelled)
 		return ctx.Err()
 	})
-	server := newTerminalTestServer(t, serverContext, executorFactoryFunc(func(ExecRequest) (remotecommand.Executor, error) {
+	server := newTerminalTestServer(serverContext, t, executorFactoryFunc(func(ExecRequest) (remotecommand.Executor, error) {
 		return executor, nil
 	}), logr.Discard())
-	conn := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "team-a", "box-a", "workspace", "")
+	conn := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "")
 
 	<-started
 	require.NoError(t, conn.WriteJSON(ClientControl{Type: "input", Data: "blocked input"}))
@@ -355,9 +355,9 @@ func TestTerminalSessionsAreIndependent(t *testing.T) {
 			return err
 		}), nil
 	})
-	server := newTerminalTestServer(t, t.Context(), factory, logr.Discard())
-	first := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "team-a", "box-a", "workspace", "")
-	second := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "team-a", "box-a", "workspace", "")
+	server := newTerminalTestServer(t.Context(), t, factory, logr.Discard())
+	first := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "")
+	second := dialTerminal(t, server.URL, terminalOrigin(t, server.URL), "")
 
 	require.NoError(t, first.WriteJSON(ClientControl{Type: "input", Data: "first"}))
 	require.NoError(t, second.WriteJSON(ClientControl{Type: "input", Data: "other"}))
@@ -480,7 +480,7 @@ func (c *recordingSessionConnection) WriteJSON(value any) error {
 	return c.recordingWebSocketWriter.WriteJSON(value)
 }
 
-func newTerminalTestServer(t *testing.T, rootContext context.Context, factory ExecutorFactory, logger logr.Logger) *httptest.Server {
+func newTerminalTestServer(rootContext context.Context, t *testing.T, factory ExecutorFactory, logger logr.Logger) *httptest.Server {
 	t.Helper()
 	fixture := newTerminalFixture()
 	resolver, _, _, _ := fixture.resolver(t, TerminalScope{Namespace: "team-a"}, time.Unix(500, 0))
@@ -492,13 +492,10 @@ func dialTerminal(
 	t *testing.T,
 	serverURL string,
 	origin string,
-	namespace string,
-	sandboxName string,
-	container string,
 	extraQuery string,
 ) *websocket.Conn {
 	t.Helper()
-	conn, response, err := dialTerminalResponse(t, serverURL, origin, namespace, sandboxName, container, extraQuery)
+	conn, response, err := dialTerminalResponse(t, serverURL, origin, "team-a", "box-a", "workspace", extraQuery)
 	if response != nil {
 		response.Body.Close()
 	}

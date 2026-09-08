@@ -21,7 +21,6 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -347,9 +346,9 @@ func TestEmbeddedPortalAssets(t *testing.T) {
 	}
 	assert.NotContains(t, document, "http://")
 	assert.NotContains(t, document, "https://")
-	assert.NotRegexp(t, regexp.MustCompile(`(?i)<script(?:\s[^>]*)?>\s*[^<\s]`), document)
-	assert.NotRegexp(t, regexp.MustCompile(`(?i)<style(?:\s|>)`), document)
-	assert.NotRegexp(t, regexp.MustCompile(`(?i)\son[a-z]+\s*=`), document)
+	assert.NotRegexp(t, `(?i)<script(?:\s[^>]*)?>\s*[^<\s]`, document)
+	assert.NotRegexp(t, `(?i)<style(?:\s|>)`, document)
+	assert.NotRegexp(t, `(?i)\son[a-z]+\s*=`, document)
 }
 
 func TestPortalJavaScriptContract(t *testing.T) {

@@ -30,7 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clienttesting "k8s.io/client-go/testing"
-	"k8s.io/utils/ptr"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	clientfake "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned/fake"
 	extensionsfake "sigs.k8s.io/agent-sandbox/clients/k8s/extensions/clientset/versioned/fake"
@@ -135,7 +134,7 @@ func TestInventoryClaimLifecycleTakesPrecedence(t *testing.T) {
 	sb := readySandbox("box-a", "team-a")
 	sb.Spec.ShutdownTime = &sandboxShutdown
 	sb.OwnerReferences = []metav1.OwnerReference{{
-		APIVersion: extensionsv1beta1.GroupVersion.String(), Kind: "SandboxClaim", Name: claim.Name, UID: claim.UID, Controller: ptr.To(true),
+		APIVersion: extensionsv1beta1.GroupVersion.String(), Kind: "SandboxClaim", Name: claim.Name, UID: claim.UID, Controller: new(true),
 	}}
 
 	got := listInventoryWithClaims(t, time.Unix(400, 0), []*sandboxv1beta1.Sandbox{sb}, []*extensionsv1beta1.SandboxClaim{claim})
@@ -189,7 +188,7 @@ func TestInventoryTTLAfterFinished(t *testing.T) {
 	assert.Equal(t, LifecycleSummary{
 		Source:                  "SandboxClaim",
 		ExpiresAt:               &deadline,
-		TTLSecondsAfterFinished: ptr.To(int32(60)),
+		TTLSecondsAfterFinished: new(int32(60)),
 		RetentionDeadline:       &deadline,
 		Expired:                 true,
 	}, record.Lifecycle)
@@ -211,7 +210,7 @@ func TestInventoryTTLBeforeFinishedShowsPolicyOnly(t *testing.T) {
 
 	assert.Equal(t, LifecycleSummary{
 		Source:                  "SandboxClaim",
-		TTLSecondsAfterFinished: ptr.To(int32(60)),
+		TTLSecondsAfterFinished: new(int32(60)),
 	}, record.Lifecycle)
 	assert.True(t, record.TerminalEligible)
 }
@@ -619,7 +618,7 @@ func setClaimOwner(sandbox *sandboxv1beta1.Sandbox, claim *extensionsv1beta1.San
 		Kind:       extensionsv1beta1.SandboxClaimKind,
 		Name:       claim.Name,
 		UID:        claim.UID,
-		Controller: ptr.To(true),
+		Controller: new(true),
 	}}
 }
 

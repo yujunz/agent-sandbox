@@ -30,7 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
-	"k8s.io/utils/ptr"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	clientfake "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned/fake"
 	extensionsfake "sigs.k8s.io/agent-sandbox/clients/k8s/extensions/clientset/versioned/fake"
@@ -476,7 +475,7 @@ func TestTerminalResolver(t *testing.T) {
 			assert.Equal(t, tt.wantMessage, terminalErr.Error())
 			assert.NotContains(t, terminalErr.Error(), "credential")
 			if tt.wantWrappedError {
-				assert.Error(t, terminalErr.Err)
+				require.Error(t, terminalErr.Err)
 				assert.Contains(t, terminalErr.Err.Error(), "credential")
 			}
 			if tt.wantNoAPICalls {
@@ -581,7 +580,7 @@ func terminalPod(name string, sandbox *sandboxv1beta1.Sandbox) *corev1.Pod {
 				Kind:       "Sandbox",
 				Name:       sandbox.Name,
 				UID:        sandbox.UID,
-				Controller: ptr.To(true),
+				Controller: new(true),
 			}},
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "workspace"}}},

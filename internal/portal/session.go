@@ -93,8 +93,7 @@ func (h *TerminalHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.URL.Query().Get("container"),
 	)
 	if err != nil {
-		var terminalErr *TerminalError
-		if errors.As(err, &terminalErr) {
+		if terminalErr, ok := errors.AsType[*TerminalError](err); ok {
 			writeAPIError(w, terminalErr.Status, terminalErr.Message)
 		} else {
 			writeAPIError(w, http.StatusServiceUnavailable, "terminal is temporarily unavailable")
