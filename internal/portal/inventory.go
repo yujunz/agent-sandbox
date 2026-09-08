@@ -72,6 +72,8 @@ func (i *Inventory) List(ctx context.Context) (InventoryResponse, error) {
 	namespace := i.opts.Namespace
 	if i.opts.AllNamespaces {
 		namespace = metav1.NamespaceAll
+	} else if namespace == "" {
+		namespace = metav1.NamespaceDefault
 	}
 
 	list, err := i.sandboxes.Sandboxes(namespace).List(ctx, metav1.ListOptions{})
@@ -91,14 +93,10 @@ func (i *Inventory) List(ctx context.Context) (InventoryResponse, error) {
 		return cmp.Compare(left.Name, right.Name)
 	})
 
-	responseNamespace := i.opts.Namespace
-	if i.opts.AllNamespaces {
-		responseNamespace = ""
-	}
 	return InventoryResponse{
 		GeneratedAt:   now,
 		Context:       i.opts.Context,
-		Namespace:     responseNamespace,
+		Namespace:     namespace,
 		AllNamespaces: i.opts.AllNamespaces,
 		Sandboxes:     records,
 	}, nil

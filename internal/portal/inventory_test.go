@@ -209,6 +209,27 @@ func TestInventoryUsesConfiguredNamespace(t *testing.T) {
 	assert.Equal(t, "team-a", client.Actions()[0].GetNamespace())
 }
 
+func TestInventoryEmptyNamespaceDefaultsWithoutAllNamespaces(t *testing.T) {
+	client := newSandboxClientset(t,
+		sandboxWithReady("visible", metav1.NamespaceDefault, readyCondition(metav1.ConditionTrue)),
+		sandboxWithReady("hidden", "team-b", readyCondition(metav1.ConditionTrue)),
+	)
+	inventory := NewInventory(
+		client.AgentsV1beta1(),
+		extensionsfake.NewSimpleClientset().ExtensionsV1beta1(),
+		inventoryOptions("", false, time.Unix(200, 0)),
+	)
+
+	got, err := inventory.List(context.Background())
+	require.NoError(t, err)
+	require.Len(t, got.Sandboxes, 1)
+	assert.Equal(t, "visible", got.Sandboxes[0].Name)
+	assert.Equal(t, metav1.NamespaceDefault, got.Namespace)
+	require.Len(t, client.Actions(), 1)
+	assert.NotEmpty(t, client.Actions()[0].GetNamespace())
+	assert.Equal(t, metav1.NamespaceDefault, client.Actions()[0].GetNamespace())
+}
+
 func TestInventoryUsesNamespaceAllOnlyWhenEnabled(t *testing.T) {
 	client := newSandboxClientset(t,
 		sandboxWithReady("box-a", "team-a", readyCondition(metav1.ConditionTrue)),
