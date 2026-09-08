@@ -29,6 +29,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-logr/logr"
+
 	// Import all Kubernetes client auth plugins so every kubeconfig authentication
 	// method available to kubectl is also available to the portal.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -54,10 +56,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		ctrl.Log.WithName("portal").Error(err, "run Sandbox portal")
-		os.Exit(1)
+	exitCode := runMain(ctx, os.Args[1:], os.Stdout, os.Stderr, ctrl.Log.WithName("portal"))
+	if exitCode != 0 {
+		os.Exit(exitCode)
 	}
+}
+
+func runMain(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer, log logr.Logger) int {
+	if err := run(ctx, args, stdout, stderr); err != nil {
+		log.Error(errors.New("portal command failed"), "run Sandbox portal", "category", "startup")
+		return 1
+	}
+	return 0
 }
 
 func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
@@ -121,9 +131,9 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		return fmt.Errorf("build portal server: %w", err)
 	}
 
-	listener, err := net.Listen("tcp", opts.listenAddress)
+	listener, err := listenLoopback(opts.listenAddress, net.Listen)
 	if err != nil {
-		return fmt.Errorf("listen on %q: %w", opts.listenAddress, err)
+		return err
 	}
 	defer listener.Close()
 
@@ -157,4 +167,29 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		return fmt.Errorf("shut down portal server: %w", shutdownErr)
 	}
 	return nil
+}
+
+func listenLoopback(
+	address string,
+	bind func(network string, address string) (net.Listener, error),
+) (net.Listener, error) {
+	listener, err := bind("tcp", address)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %q: %w", address, err)
+	}
+
+	boundAddress := listener.Addr()
+	tcpAddress, isTCP := boundAddress.(*net.TCPAddr)
+	if isTCP && tcpAddress.IP != nil && tcpAddress.IP.IsLoopback() {
+		return listener, nil
+	}
+
+	resolvedAddress := "unknown"
+	if boundAddress != nil {
+		resolvedAddress = boundAddress.String()
+	}
+	if err := listener.Close(); err != nil {
+		return nil, fmt.Errorf("resolved listen address %q is not loopback; close listener: %w", resolvedAddress, err)
+	}
+	return nil, fmt.Errorf("resolved listen address %q is not loopback", resolvedAddress)
 }

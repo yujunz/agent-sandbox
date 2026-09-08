@@ -19,6 +19,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +28,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	logzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
 func TestPortalVersionFlag(t *testing.T) {
@@ -63,6 +66,65 @@ func TestPortalFlagParseError(t *testing.T) {
 	assert.Contains(t, stderr.String(), "Usage of agent-sandbox-portal:")
 }
 
+func TestRunMainDoesNotLogKubeconfigFailureDetails(t *testing.T) {
+	var logs bytes.Buffer
+	sensitivePath := filepath.Join(t.TempDir(), "sensitive-kubeconfig-location")
+	logger := logzap.New(logzap.UseDevMode(false), logzap.WriteTo(&logs))
+
+	exitCode := runMain(
+		context.Background(),
+		[]string{"--kubeconfig=" + sensitivePath},
+		io.Discard,
+		io.Discard,
+		logger,
+	)
+
+	assert.Equal(t, 1, exitCode)
+	assert.NotEmpty(t, logs.String(), "the command failure must be logged")
+	assert.NotContains(t, logs.String(), sensitivePath)
+	assert.NotContains(t, logs.String(), "sensitive-kubeconfig-location")
+	assert.NotContains(t, logs.String(), "no such file or directory")
+}
+
+func TestListenLoopbackRejectsResolvedNonLoopbackAddress(t *testing.T) {
+	bound := &stubListener{addr: &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 8080}}
+
+	listener, err := listenLoopback("localhost:8080", func(network string, address string) (net.Listener, error) {
+		assert.Equal(t, "tcp", network)
+		assert.Equal(t, "localhost:8080", address)
+		return bound, nil
+	})
+
+	require.ErrorContains(t, err, "resolved listen address")
+	require.ErrorContains(t, err, "not loopback")
+	assert.Nil(t, listener)
+	assert.True(t, bound.closed, "unsafe listener must be closed")
+}
+
+func TestListenLoopbackAcceptsResolvedLoopbackAddress(t *testing.T) {
+	tests := []struct {
+		name string
+		ip   string
+	}{
+		{name: "IPv4", ip: "127.0.0.1"},
+		{name: "IPv6", ip: "::1"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bound := &stubListener{addr: &net.TCPAddr{IP: net.ParseIP(tc.ip), Port: 8080}}
+
+			listener, err := listenLoopback("localhost:8080", func(string, string) (net.Listener, error) {
+				return bound, nil
+			})
+
+			require.NoError(t, err)
+			assert.Same(t, bound, listener)
+			assert.False(t, bound.closed)
+			require.NoError(t, listener.Close())
+		})
+	}
+}
+
 func TestMakefileBuildIncludesPortal(t *testing.T) {
 	contents, err := os.ReadFile(filepath.Join("..", "..", "Makefile"))
 	require.NoError(t, err)
@@ -70,4 +132,22 @@ func TestMakefileBuildIncludesPortal(t *testing.T) {
 
 	assert.Contains(t, makefile, "build: build-controller build-sandbox-router build-sandboxd build-portal")
 	assert.Contains(t, makefile, "bin/agent-sandbox-portal")
+}
+
+type stubListener struct {
+	addr   net.Addr
+	closed bool
+}
+
+func (l *stubListener) Accept() (net.Conn, error) {
+	return nil, net.ErrClosed
+}
+
+func (l *stubListener) Close() error {
+	l.closed = true
+	return nil
+}
+
+func (l *stubListener) Addr() net.Addr {
+	return l.addr
 }
